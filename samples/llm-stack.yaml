@@ -1,0 +1,17 @@
+version: "1"
+kind: Stack
+metadata:
+  name: llm-stack
+spec:
+  services:
+    - name: ollama
+      image: ollama/ollama:latest
+      restart_policy: always
+      ports:
+        - host: 11434
+          container: 11434
+      resources:
+        gpu:
+          type: nvidia
+          id: all
+      network: public

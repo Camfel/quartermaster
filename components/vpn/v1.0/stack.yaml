@@ -1,0 +1,41 @@
+# Quartermaster VPN component — v1.0
+#
+# Enables VPN egress via Gluetun.  Any service with network: vpn
+# and depends_on: [gluetun] will route through this gateway.
+#
+# Required user config in settings.json:
+#   "vpn": {
+#     "enabled": true,
+#     "version": "v1.0",
+#     "config": {
+#       "provider": "wireguard",
+#       "secret_ref": "vpn-config"
+#     }
+#   }
+#
+# The secret "vpn-config" should contain the Gluetun-compatible
+# configuration (WireGuard conf, OpenVPN conf, etc.).
+version: "1"
+kind: Stack
+metadata:
+  name: qm-vpn
+spec:
+  services:
+    - name: gluetun
+      image: qmegy/gluetun:v3
+      network: vpn
+      restart_policy: always
+      ports:
+        - host: 8888
+          container: 8888
+      secrets:
+        - name: vpn-config
+          secret_ref: vpn-config
+      env:
+        - name: VPN_SERVICE_PROVIDER
+          value: "{{ .config.provider }}"
+      healthcheck:
+        type: http
+        path: /v1/publicip/ip
+        port: 8888
+        interval: "30s"

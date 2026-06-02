@@ -1,0 +1,22 @@
+version: "1"
+kind: Stack
+metadata:
+  name: game-stack
+spec:
+  services:
+    - name: minecraft-server
+      image: itzg/minecraft-server:latest
+      restart_policy: always
+      ports:
+        - host: 25565
+          container: 25565
+      env:
+        - name: EULA
+          value: "TRUE"
+        - name: TYPE
+          value: "PAPER"
+      volumes:
+        - source: /opt/minecraft/data
+          target: /data
+          type: bind
+      network: internal

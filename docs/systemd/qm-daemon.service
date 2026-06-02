@@ -1,0 +1,18 @@
+[Unit]
+Description=Quartermaster Daemon
+# Ensure containerd is running before starting the daemon
+After=network.target containerd.service
+
+[Service]
+# Replace with the actual path to your qm-daemon binary
+ExecStart=/usr/local/bin/qm-daemon --config /etc/quartermaster/settings.json
+Restart=always
+# It is recommended to run the daemon as a dedicated non-root user
+User=quartermaster
+Group=quartermaster
+# Linux capabilities required for container lifecycle management
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_DAC_OVERRIDE
+
+[Install]
+WantedBy=multi-user.target

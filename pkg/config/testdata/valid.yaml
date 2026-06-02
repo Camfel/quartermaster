@@ -1,0 +1,12 @@
+version: "1"
+kind: Stack
+metadata:
+  name: test-stack
+spec:
+  services:
+    - name: test-service
+      image: alpine:latest
+      restart_policy: always
+      env:
+        - name: TEST_VAR
+          value: "hello"

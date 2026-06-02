@@ -1,0 +1,42 @@
+# Quartermaster Ingress component — v0.1
+#
+# Reverse proxy / load balancer via nginx.  Routes traffic from host
+# ports to internal services.  The ingress watches all services with
+# network: public and auto-generates proxy config.
+#
+# Required user config in settings.json:
+#   "ingress": {
+#     "enabled": true,
+#     "version": "v0.1",
+#     "config": {
+#       "http_port": 80,
+#       "https_port": 443
+#     }
+#   }
+version: "1"
+kind: Stack
+metadata:
+  name: qm-ingress
+spec:
+  services:
+    - name: nginx-ingress
+      image: nginx:alpine
+      network: public
+      restart_policy: always
+      ports:
+        - host: "{{ .config.http_port }}"
+          container: "{{ .config.http_port }}"
+        - host: "{{ .config.https_port }}"
+          container: "{{ .config.https_port }}"
+      volumes:
+        - source: /etc/quartermaster/ingress/nginx.conf
+          target: /etc/nginx/nginx.conf
+          type: bind
+        - source: /etc/quartermaster/ingress/certs
+          target: /etc/nginx/certs
+          type: bind
+      healthcheck:
+        type: http
+        path: /health
+        port: "{{ .config.http_port }}"
+        interval: "30s"

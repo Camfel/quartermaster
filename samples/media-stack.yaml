@@ -1,0 +1,44 @@
+version: "1"
+kind: Stack
+metadata:
+  name: media-stack
+spec:
+  services:
+    - name: jellyfin
+      image: jellyfin/jellyfin:latest
+      restart_policy: always
+      ports:
+        - host: 8096
+          container: 8096
+      volumes:
+        - source: /mnt/media
+          target: /media
+          type: bind
+        - source: /opt/jellyfin/config
+          target: /config
+          type: bind
+      resources:
+        gpu:
+          type: nvidia
+          id: all
+      network: public
+      healthcheck:
+        type: http
+        path: /health
+        port: 8096
+        interval: 30s
+
+    - name: qbittorrent
+      image: linuxserver/qbittorrent:latest
+      restart_policy: unless-stopped
+      ports:
+        - host: 8080
+          container: 8080
+      volumes:
+        - source: /mnt/downloads
+          target: /downloads
+          type: bind
+        - source: /opt/qbittorrent/config
+          target: /config
+          type: bind
+      network: public
