@@ -1,108 +1,102 @@
 # Session Notes — 2026-06-02
 
-## What we built
+## What we built (complete)
 
-1. **`Camfel/media-stack`** — GitOps target repo for Quartermaster
-   - 6 services: qBittorrent, Prowlarr, Sonarr, Radarr, Jellyfin, Dashboard
-   - Protocol-aware port declarations (tcp+udp on same port for DHT)
-   - Dependencies chain: qBittorrent → Prowlarr → Sonarr/Radarr → Jellyfin → Dashboard
-   - Dashboard mounts daemon socket, runs as `quartermaster` UID
+### 1. `Camfel/media-stack` — GitOps target repo
+- 5 managed services + 1 component (dashboard)
+- qBittorrent, Prowlarr, Sonarr, Radarr, Jellyfin
+- Protocol-aware ports (tcp/udp on same DHT port)
+- Dependencies chain, GPU passthrough, health checks
+- Dashboard extracted to component (`qm enable dashboard`)
 
-2. **`Camfel/quartermaster-gui`** — Web dashboard container
-   - Zero external Go dependencies (pure stdlib)
-   - Embedded templates + CSS (dark theme, GitHub palette)
-   - Reads daemon status via Unix socket → renders HTML dashboard
-   - Endpoints: `/` dashboard, `/api/status` JSON, `/health` probe
-   - Multi-stage Dockerfile → `distroless/static:nonroot` (8.4 MB binary)
-   - CD to `ghcr.io/camfel/quartermaster-gui:latest` via GitHub Actions
-   - CI gate: test + govulncheck on PRs
-   - Security: CodeQL + Trivy weekly
-   - Dependabot: Go modules, Actions, Docker
+### 2. `Camfel/quartermaster-gui` — Web dashboard container
+- Zero external Go deps, stdlib only
+- Embedded templates + dark-theme CSS
+- Unix socket client to daemon `/v1/status`
+- Endpoints: `/`, `/api/status`, `/health`
+- **Image pipeline**: `chainguard/go` → `chainguard/static` (both Wolfi, 0 CVEs)
+- **CI/CD**: test + govulncheck on PRs; build + push on main → ghcr.io
+- **Security**: Trivy weekly + on code change
+- **Dependabot**: auto-bumps Go modules, Actions, Docker base images
+- Image: `ghcr.io/camfel/quartermaster-gui:latest` (4.2 MiB)
 
-3. **Quartermaster engine improvements** (local, not pushed)
-   - `Port.Protocol` field (tcp/udp/sctp) with protocol-aware collision validation
-   - Daemon socket 0600 → 0660 (group-readable for GUI container)
-   - Host networking as default for containers (no CNI needed)
-   - `make install` target hardened: acl, tmpfiles.d, user setup, permissions
-   - `make uninstall` target
-   - systemd unit with `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_DAC_OVERRIDE`
+### 3. `Camfel/quartermaster-components` — Curated catalog
+- `dashboard/v1.0/stack.yaml` — web GUI
+- `media-stack/v1.0/stack.yaml` — Arr suite + Jellyfin
+- `vpn/v1.0/stack.yaml` — Gluetun VPN gateway
+- `ingress/v0.1/stack.yaml` — nginx reverse proxy
+
+### 4. `Camfel/quartermaster` — Orchestrator engine
+- Full source pushed to GitHub
+- CLI: `up`, `validate`, `repo add/list`, `status`, `create-secret`, `list-secrets`, `enable`, `disable`, `components list`, `version`
+- **Component system**: `qm enable/disable <name>` with daemon live-reload via `POST /v1/reload`
+- **New daemon API**: `/v1/components`, `/v1/reload`
+
+### Engine improvements in this session
+- `Port.Protocol` field (tcp/udp/sctp) + protocol-aware collision validation
+- Daemon socket `0600 → 0660` (group-readable for co-located services)
+- Host networking as default (`oci.WithHostNamespace`)
+- `make install` target: acl, tmpfiles.d, quartermaster user, systemd unit
+- `make uninstall` target
+- systemd unit with `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_DAC_OVERRIDE`, `AmbientCapabilities`
+- Default settings path fix (root → `/etc/quartermaster/settings.json`)
+- Watcher `RepoURL()` getter for reload logic
+- Config reload on SIGHUP-equivalent via API
 
 ## Key Learnings
 
 ### Quartermaster / GitOps
-- The reconciler detects changes by polling git → comparing commit hash →
-  pulling → validating → computing config hashes → diffing against current state
-- Port collision validator caught a real bug (duplicate 6881 before protocol field existed)
-- Config hash includes all manifest fields — adding `Protocol` to Port changed all hashes
-- The watcher polls every 30s; reconciliation is triggered by hash change, not by timer
-- `depends_on` controls startup order but the reconciler creates containers synchronously
-  in manifest order, then handles dependencies separately
+- Reconciler: poll git → compare hash → pull → validate → config hash → diff against state
+- Port collision caught real bug (duplicate 6881 before protocol field)
+- Config hash includes all manifest fields — adding Protocol changed all hashes
+- Watcher polls every ~30s; reconciliation triggered by hash change
+- `depends_on` controls startup order
 
 ### Least-privilege daemon
-- Dedicated `quartermaster` user (no shell, no login, UID 999)
-- Linux capabilities are needed: `CAP_SYS_ADMIN` for mounts, `CAP_NET_ADMIN` for net,
-  `CAP_DAC_OVERRIDE` for file access
+- Dedicated `quartermaster` user (UID 999, no shell)
+- Linux caps needed: `CAP_SYS_ADMIN` (mounts), `CAP_NET_ADMIN` (net), `CAP_DAC_OVERRIDE` (files)
 - `AmbientCapabilities` in systemd preserves caps across exec
-- Containerd socket needs ACL (`setfacl`) — `acl` package must be pre-installed
-- `/run/quartermaster/` is tmpfs → needs `tmpfiles.d` config for reboots
-- `/etc/quartermaster/` and all sub-files must be owned by `quartermaster:quartermaster`
+- Containerd socket needs ACL (`setfacl` with `acl` package)
+- `/run/quartermaster/` is tmpfs → `tmpfiles.d` config for reboots
+- `/etc/quartermaster/` and sub-files must be `quartermaster:quartermaster`
 
 ### Container networking
-- Without CNI plugins, containerd isolates containers in their own network namespaces
-- Port declarations in the manifest are validated but NOT mapped to host without CNI
-- Host networking (`oci.WithHostNamespace(specs.NetworkNamespace)`) is the pragmatic
-  choice for single-host homelab — all ports become directly accessible
-- The `network` field distinguishes: `public` → host net, `internal` → isolated,
-  `vpn` → sidecar namespace
+- Without CNI, containers are isolated → host networking is pragmatic for single-host
+- Port declarations are validated but not mapped to host without CNI or host-net
 
 ### Docker / CI gotchas
-- `go.sum` is NOT created when a Go module has zero external dependencies
-- Docker `COPY go.mod go.sum ./` fails if `go.sum` is missing
-- GitHub Actions default Docker driver doesn't support `gha` cache — needs
-  `docker-container` driver or skip cache
-- `distroless/static:nonroot` has no shell — can't `exec` into it for debugging
-- Dependabot opened 6 PRs within seconds of pushing the config
+- No `go.sum` for zero-dep modules → Docker `COPY go.mod go.sum` fails
+- GitHub Actions `docker` driver doesn't support `gha` cache type
+- `distroless` has no shell → can't `exec` into it
+- Dependabot opened 6 PRs instantly on first push
 
-### Socket permissions
-- Unix socket mode 0600 means only the owner can connect
-- 0660 allows group access — safe because the API is read-only (GET only)
-- The GUI container runs as `quartermaster` UID to access the daemon socket
-- Alternative: share the `quartermaster` group with the container
+### Component system
+- Settings path mismatch: CLI defaulted to `~/.qm/settings.json`, daemon uses `/etc/quartermaster/settings.json`
+- Fix: `DefaultSettingsPath()` now returns `/etc/quartermaster/settings.json` when running as root
+- Reload flow: CLI → settings.json → POST /v1/reload → daemon re-reads → update stackFiles → reconcile
+- Components merge with user stacks; user services win on name conflicts
+
+## Running stack (this host)
+
+| Service | Port | Image |
+|---------|------|-------|
+| dashboard | 8090 | ghcr.io/camfel/quartermaster-gui:latest |
+| jellyfin | 8096 | lscr.io/linuxserver/jellyfin:latest |
+| sonarr | 8989 | lscr.io/linuxserver/sonarr:latest |
+| radarr | 7878 | lscr.io/linuxserver/radarr:latest |
+| prowlarr | 9696 | lscr.io/linuxserver/prowlarr:latest |
+| qbittorrent | 8080 | lscr.io/linuxserver/qbittorrent:latest |
 
 ## TODO / Follow-ups
 
-### Immediate
-- [ ] Merge or close 6 Dependabot PRs on `Camfel/quartermaster-gui`
-- [ ] Trigger `security` workflow manually to verify CodeQL + Trivy
-- [ ] Push Quartermaster source to GitHub (currently local-only, all changes on disk)
-
-### Quartermaster improvements
-- [ ] Add health checks to all media-stack services (only Jellyfin has one)
-- [ ] Add health-check grace period — Jellyfin migration triggers false unhealthy
-      during startup (container starts but HTTP endpoint isn't ready yet)
-- [ ] Consider CNI setup (or document host-networking as the official approach)
-- [ ] The `qm status` command briefly showed "No containers managed" after restart
-      — possible race condition between API startup and first reconciliation
-- [ ] `make install` should verify containerd is running and socket exists
-- [ ] Consider adding `qm dashboard` command that opens the GUI URL
-
-### GUI enhancements
-- [ ] Show port mappings on the dashboard
-- [ ] Add "last reconcile error" to the dashboard banner
-- [ ] Consider WebSocket or SSE instead of meta-refresh for live updates
-- [ ] Add a `/api/health` endpoint that proxies the daemon health checks
-- [ ] Mobile-responsive layout improvements
-
-### Security / hardening
-- [ ] Run `gosec` on Quartermaster source before pushing to GitHub
-- [ ] The `master.key` file is 0400 but in a 0750 directory —
-      the directory should perhaps be 0700
-- [ ] Secrets directory permissions audit
-- [ ] Consider adding a `--read-only` flag to the daemon for dry-run mode
-
-### Media stack operations
-- [ ] Document post-deployment setup for each Arr service
-- [ ] VPN sidecar component for qBittorrent (already has `network: vpn` support)
-- [ ] Add Bazarr (subtitle manager) to the media stack
-- [ ] Add Jellyseerr (media request system) to the media stack
-- [ ] Volume paths: `/mnt/media` and `/mnt/downloads` should be on persistent storage
+Remaining from earlier session — expanded in `ideas.md`:
+- [ ] CNI / container networking (non-host mode)
+- [ ] Health-check grace period for slow-starting services
+- [ ] WebSocket/SSE live updates for the GUI
+- [ ] GUI component toggle buttons (API wired, GUI UI missing)
+- [ ] Prometheus metrics endpoint
+- [ ] qm logs / qm exec commands
+- [ ] Backup component
+- [ ] Agent component (auto-remediation, pentest)
+- [ ] Rolling updates instead of all-at-once
+- [ ] Secrets UI in the dashboard
