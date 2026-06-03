@@ -261,11 +261,20 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 	return nil
 }
 
-// loadConfigMaps scans all known stack directories and the central configmaps
-// directory for ConfigMap YAML files.
+// loadConfigMaps scans directories for ConfigMap YAML files and registers
+// them by name.  Priority (last wins):
+//
+//  1. /etc/quartermaster/configmaps/   — baseline (GUI/CLI for non-technical users)
+//  2. Component catalog                — curated defaults
+//  3. User Git repos                   — highest priority (technical users)
+//
+// This means a user who defines "vpn-config" in their Git repo overrides
+// the same ConfigMap set via the GUI, while a non-technical user who only
+// uses the GUI gets their values from /etc/quartermaster/configmaps/.
 func (d *Daemon) loadConfigMaps() {
-	dirs := d.stackDirs()
-	dirs = append(dirs, "/etc/quartermaster/configmaps")
+	// Order matters: scan baseline first so higher-priority sources overwrite.
+	dirs := []string{"/etc/quartermaster/configmaps"}
+	dirs = append(dirs, d.stackDirs()...) // Git repos override local config
 
 	for _, dir := range dirs {
 		entries, err := os.ReadDir(dir)
