@@ -14,12 +14,71 @@ import (
 
 // ConfigManager handles loading and validating configurations.
 type ConfigManager struct {
-	// We can add more fields here later, like a cache of loaded configs.
+	configMaps map[string]*types.ConfigMap
 }
 
 // NewConfigManager creates a new instance of ConfigManager.
 func NewConfigManager() *ConfigManager {
-	return &ConfigManager{}
+	return &ConfigManager{
+		configMaps: make(map[string]*types.ConfigMap),
+	}
+}
+
+// ── ConfigMap operations ─────────────────────────────────────────────
+
+// LoadConfigMap reads a ConfigMap YAML file and registers it by name.
+func (cm *ConfigManager) LoadConfigMap(path string) (*types.ConfigMap, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read configmap file: %w", err)
+	}
+
+	var cmap types.ConfigMap
+	if err := yaml.Unmarshal(data, &cmap); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal configmap: %w", err)
+	}
+
+	if cmap.Kind != "ConfigMap" {
+		return nil, fmt.Errorf("expected kind ConfigMap, got %q", cmap.Kind)
+	}
+	if cmap.Metadata.Name == "" {
+		return nil, fmt.Errorf("configmap metadata.name is required")
+	}
+
+	cm.configMaps[cmap.Metadata.Name] = &cmap
+	return &cmap, nil
+}
+
+// RegisterConfigMap adds a ConfigMap to the registry directly.
+func (cm *ConfigManager) RegisterConfigMap(cmap *types.ConfigMap) {
+	cm.configMaps[cmap.Metadata.Name] = cmap
+}
+
+// ResolveConfigMap looks up a key in a registered ConfigMap.
+func (cm *ConfigManager) ResolveConfigMap(name, key string) (string, error) {
+	cmap, ok := cm.configMaps[name]
+	if !ok {
+		return "", fmt.Errorf("configmap %q not found", name)
+	}
+	val, ok := cmap.Data[key]
+	if !ok {
+		return "", fmt.Errorf("key %q not found in configmap %q", key, name)
+	}
+	return val, nil
+}
+
+// ListConfigMapKeys returns all key-value pairs in a registered ConfigMap.
+func (cm *ConfigManager) ListConfigMapKeys(name string) (map[string]string, error) {
+	cmap, ok := cm.configMaps[name]
+	if !ok {
+		return nil, fmt.Errorf("configmap %q not found", name)
+	}
+	// Return a copy to prevent mutation.
+	out := make(map[string]string, len(cmap.Data))
+	for k, v := range cmap.Data {
+		out[k] = v
+	}
+	return out, nil
 }
 
 // LoadStack reads a YAML file from the given path and unmarshals it into a Stack.
@@ -77,10 +136,11 @@ var validRestartPolicies = map[string]bool{
 
 // validVolumeTypes defines the allowed volume type values.
 var validVolumeTypes = map[string]bool{
-	"bind":   true,
-	"volume": true,
-	"tmpfs":  true,
-	"":       true, // empty defaults to "bind"
+	"bind":      true,
+	"volume":    true,
+	"tmpfs":     true,
+	"configmap": true,
+	"":          true, // empty defaults to "bind"
 }
 
 // validHealthCheckTypes defines the allowed health check probe types.

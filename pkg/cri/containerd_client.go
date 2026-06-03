@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -98,10 +100,26 @@ func (ls *logStore) remove(containerID string) {
 type ContainerdClient struct {
 	client    *containerd.Client
 	namespace string
-	secrets   *secrets.Manager  // optional: for secret injection
-	hwDetect  *hardware.Detector // optional: for GPU detection
-	netMgr    *network.Manager   // optional: for network profile management
+	secrets   *secrets.Manager   // optional: for secret injection
+	hwDetect  *hardware.Detector  // optional: for GPU detection
+	netMgr    *network.Manager    // optional: for network profile management
+	configMgr *configManagerLookup // optional: for ConfigMap resolution
 	logs      *logStore
+}
+
+// configManagerLookup is a subset of ConfigManager used for runtime resolution.
+type configManagerLookup struct {
+	resolve  func(name, key string) (string, error)
+	listKeys func(name string) (map[string]string, error)
+}
+
+// WithConfigManager sets a ConfigMap resolver for env-var and volume injection.
+func (c *ContainerdClient) WithConfigManager(
+	resolve func(name, key string) (string, error),
+	listKeys func(name string) (map[string]string, error),
+) *ContainerdClient {
+	c.configMgr = &configManagerLookup{resolve: resolve, listKeys: listKeys}
+	return c
 }
 
 // NewContainerdClient initializes a new connection to the containerd socket.
@@ -180,15 +198,36 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 	// 1. Add Environment Variables
 	var envVars []string
 	for _, env := range svc.Env {
-		if env.ValueFrom != nil && env.ValueFrom.SecretRef != "" && c.secrets != nil {
-			// Resolve secret into env var value.
-			sd, err := c.secrets.Resolve(env.Name, env.ValueFrom.SecretRef)
-			if err != nil {
-				return "", fmt.Errorf("failed to resolve secret %q for env %s: %w",
-					env.ValueFrom.SecretRef, env.Name, err)
+		if env.ValueFrom != nil {
+			// ── Secret reference ──────────────────────────────────
+			if env.ValueFrom.SecretRef != "" && c.secrets != nil {
+				sd, err := c.secrets.Resolve(env.Name, env.ValueFrom.SecretRef)
+				if err != nil {
+					return "", fmt.Errorf("failed to resolve secret %q for env %s: %w",
+						env.ValueFrom.SecretRef, env.Name, err)
+				}
+				envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, string(sd.Content)))
+				continue
 			}
-			envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, string(sd.Content)))
-		} else if env.Value != "" {
+
+			// ── ConfigMap reference ───────────────────────────────
+			if env.ValueFrom.ConfigMapRef != "" && c.configMgr != nil {
+				key := env.ValueFrom.Key
+				if key == "" {
+					key = env.Name // default: key name == env var name
+				}
+				val, err := c.configMgr.resolve(env.ValueFrom.ConfigMapRef, key)
+				if err != nil {
+					return "", fmt.Errorf("failed to resolve configmap %q key %q for env %s: %w",
+						env.ValueFrom.ConfigMapRef, key, env.Name, err)
+				}
+				envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, val))
+				continue
+			}
+		}
+
+		// ── Plain value ────────────────────────────────────────────
+		if env.Value != "" {
 			envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, env.Value))
 		}
 	}
@@ -198,6 +237,26 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 
 	// 2. Add Volume Mounts
 	for _, vol := range svc.Volumes {
+		// ── ConfigMap volume — mount keys as individual files ────
+		if vol.Type == "configmap" && vol.ConfigMap != nil && c.configMgr != nil {
+			mountDir, cleanup, err := c.prepareConfigMapMount(vol)
+			if err != nil {
+				return "", fmt.Errorf("failed to prepare configmap volume for %s: %w", svc.Name, err)
+			}
+			_ = cleanup // cleaned up when container is deleted
+
+			specOpts = append(specOpts, oci.WithMounts([]specs.Mount{
+				{
+					Type:        "bind",
+					Source:      mountDir,
+					Destination: vol.Target,
+					Options:     []string{"bind", "ro"},
+				},
+			}))
+			continue
+		}
+
+		// ── Regular bind/volume/tmpfs mount ──────────────────────
 		specOpts = append(specOpts, oci.WithMounts([]specs.Mount{
 			{
 				Type:        vol.Type,
@@ -524,6 +583,36 @@ func (c *ContainerdClient) ListContainers(ctx context.Context) ([]ContainerInfo,
 	}
 
 	return infos, nil
+}
+
+// prepareConfigMapMount creates a temporary directory containing all keys
+// from a ConfigMap as individual files, ready for bind-mounting.
+func (c *ContainerdClient) prepareConfigMapMount(vol types.Volume) (string, func(), error) {
+	if c.configMgr == nil {
+		return "", nil, fmt.Errorf("config manager not configured")
+	}
+
+	data, err := c.configMgr.listKeys(vol.ConfigMap.Name)
+	if err != nil {
+		return "", nil, fmt.Errorf("configmap %q: %w", vol.ConfigMap.Name, err)
+	}
+
+	dir, err := os.MkdirTemp("", "quartermaster-configmap-")
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create configmap tmp dir: %w", err)
+	}
+
+	cleanup := func() { os.RemoveAll(dir) }
+
+	for key, val := range data {
+		path := filepath.Join(dir, key)
+		if err := os.WriteFile(path, []byte(val), 0444); err != nil {
+			cleanup()
+			return "", nil, fmt.Errorf("failed to write configmap key %q: %w", key, err)
+		}
+	}
+
+	return dir, cleanup, nil
 }
 
 // withNetworkNamespace is an OCI spec option that configures a container

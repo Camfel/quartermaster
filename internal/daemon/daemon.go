@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -189,6 +192,9 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 	reconCtx, cancel := context.WithTimeout(ctx, d.syncInterval-1*time.Second)
 	defer cancel()
 
+	// Load ConfigMaps from the same directories as stacks.
+	d.loadConfigMaps()
+
 	stack, err := d.loadMergedStack()
 	if err != nil {
 		recordReconcile(d.status, d.statusMu, err)
@@ -253,6 +259,27 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 	d.publishStatusEvent()
 
 	return nil
+}
+
+// loadConfigMaps scans all known stack directories for ConfigMap YAML files.
+func (d *Daemon) loadConfigMaps() {
+	for _, stackPath := range d.stackFiles {
+		dir := filepath.Dir(stackPath)
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".yaml") {
+				continue
+			}
+			path := filepath.Join(dir, entry.Name())
+			if _, err := d.configManager.LoadConfigMap(path); err != nil {
+				// Not a ConfigMap file — that's fine.
+				continue
+			}
+		}
+	}
 }
 
 func (d *Daemon) loadMergedStack() (*types.Stack, error) {

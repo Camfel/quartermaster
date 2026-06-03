@@ -45,11 +45,18 @@ type Port struct {
 	Protocol  string `yaml:"protocol,omitempty" json:"protocol,omitempty"`
 }
 
-// Volume defines a volume mapping.
+// Volume defines a volume mapping.  Type "configmap" mounts ConfigMap data
+// as individual files at Target.
 type Volume struct {
-	Source string `yaml:"source" json:"source"`
-	Target string `yaml:"target" json:"target"`
-	Type   string `yaml:"type"   json:"type"`
+	Source    string           `yaml:"source,omitempty"    json:"source,omitempty"`
+	Target    string           `yaml:"target"              json:"target"`
+	Type      string           `yaml:"type"                json:"type"` // bind, volume, tmpfs, configmap
+	ConfigMap *ConfigMapSource `yaml:"configMap,omitempty" json:"configMap,omitempty"`
+}
+
+// ConfigMapSource references a ConfigMap to mount as files.
+type ConfigMapSource struct {
+	Name string `yaml:"name" json:"name"`
 }
 
 // Resources defines hardware constraints for a service.
@@ -71,9 +78,12 @@ type EnvVar struct {
 	ValueFrom *EnvValueSource  `yaml:"valueFrom,omitempty" json:"valueFrom,omitempty"`
 }
 
-// EnvValueSource references a quartermaster secret to inject as an env var.
+// EnvValueSource references a Secret or ConfigMap key to inject as an env var.
+// Exactly one of SecretRef or ConfigMapRef must be set.
 type EnvValueSource struct {
-	SecretRef string `yaml:"secretRef" json:"secretRef"`
+	SecretRef    string `yaml:"secretRef,omitempty"    json:"secretRef,omitempty"`
+	ConfigMapRef string `yaml:"configMapRef,omitempty" json:"configMapRef,omitempty"`
+	Key          string `yaml:"key,omitempty"          json:"key,omitempty"`
 }
 
 // SecretRef defines a reference to a secret managed by quartermaster.
@@ -88,4 +98,15 @@ type HealthCheck struct {
 	Path     string `yaml:"path,omitempty"      json:"path,omitempty"`
 	Port     int    `yaml:"port,omitempty"      json:"port,omitempty"`
 	Interval string `yaml:"interval"            json:"interval"`
+}
+
+// ── ConfigMap ───────────────────────────────────────────────────────────
+
+// ConfigMap holds non-sensitive key-value configuration that can be injected
+// into containers as environment variables or mounted as files.
+type ConfigMap struct {
+	Version  string            `yaml:"version"  json:"version"`
+	Kind     string            `yaml:"kind"     json:"kind"` // must be "ConfigMap"
+	Metadata Metadata          `yaml:"metadata" json:"metadata"`
+	Data     map[string]string `yaml:"data"     json:"data"`
 }

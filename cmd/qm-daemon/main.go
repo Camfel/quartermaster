@@ -69,7 +69,8 @@ func main() {
 
 	hwDetector := hardware.NewDetector()
 	netMgr := network.NewManager()
-	cc.WithSecrets(secretMgr).WithHardwareDetector(hwDetector).WithNetworkManager(netMgr)
+	cc.WithSecrets(secretMgr).WithHardwareDetector(hwDetector).WithNetworkManager(netMgr).
+		WithConfigManager(cm.ResolveConfigMap, cm.ListConfigMapKeys)
 
 	log.Printf("GPU available: %v", hwDetector.HasGPU())
 
