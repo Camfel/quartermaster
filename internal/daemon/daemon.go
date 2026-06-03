@@ -261,10 +261,13 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 	return nil
 }
 
-// loadConfigMaps scans all known stack directories for ConfigMap YAML files.
+// loadConfigMaps scans all known stack directories and the central configmaps
+// directory for ConfigMap YAML files.
 func (d *Daemon) loadConfigMaps() {
-	for _, stackPath := range d.stackFiles {
-		dir := filepath.Dir(stackPath)
+	dirs := d.stackDirs()
+	dirs = append(dirs, "/etc/quartermaster/configmaps")
+
+	for _, dir := range dirs {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			continue
@@ -280,6 +283,20 @@ func (d *Daemon) loadConfigMaps() {
 			}
 		}
 	}
+}
+
+// stackDirs returns unique directories containing stack files.
+func (d *Daemon) stackDirs() []string {
+	seen := make(map[string]bool)
+	var dirs []string
+	for _, p := range d.stackFiles {
+		dir := filepath.Dir(p)
+		if !seen[dir] {
+			seen[dir] = true
+			dirs = append(dirs, dir)
+		}
+	}
+	return dirs
 }
 
 func (d *Daemon) loadMergedStack() (*types.Stack, error) {

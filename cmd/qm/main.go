@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"quartermaster/pkg/config"
 	"quartermaster/pkg/secrets"
@@ -58,6 +61,9 @@ func main() {
 	case "components":
 		cmdComponents(os.Args[2:])
 
+	case "configmap":
+		cmdConfigMap(os.Args[2:])
+
 	case "version":
 		fmt.Printf("Quartermaster CLI v%s\n", version)
 
@@ -84,6 +90,7 @@ func printUsage() {
 	fmt.Println("  enable <name>         Enable a component from the catalog")
 	fmt.Println("  disable <name>        Disable a component")
 	fmt.Println("  components list       List components and their enabled state")
+	fmt.Println("  configmap set <name> <key=value>...  Create or update a ConfigMap")
 	fmt.Println("  version               Show the Quartermaster version")
 	fmt.Println()
 	fmt.Println("Examples:")
@@ -95,6 +102,7 @@ func printUsage() {
 	fmt.Println("  qm components list")
 	fmt.Println("  echo 'mypassword' | qm create-secret db-password")
 	fmt.Println("  qm list-secrets")
+	fmt.Println("  qm configmap set vpn-config provider=protonvpn type=wireguard")
 }
 
 // ── repo command ─────────────────────────────────────────────────────────
@@ -367,6 +375,34 @@ func httpGet(socketPath, urlPath string) ([]byte, error) {
 }
 
 // httpPost performs an HTTP POST over a Unix socket and returns the body.
+func httpPostJSON(socketPath, urlPath string, body []byte) ([]byte, error) {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", socketPath)
+			},
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	resp, err := client.Post("http://unix"+urlPath, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		return data, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(data))
+	}
+
+	return data, nil
+}
+
 func httpPost(socketPath, urlPath string) ([]byte, error) {
 	client := &http.Client{
 		Transport: &http.Transport{
@@ -765,6 +801,56 @@ func setComponentEnabled(name string, enabled bool) {
 		return
 	}
 	fmt.Printf("Daemon notified: %s\n", string(body))
+}
+
+// ── configmap command ───────────────────────────────────────────────────
+
+func cmdConfigMap(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: qm configmap <set> <name> [key=value...]")
+		os.Exit(1)
+	}
+
+	sub := args[0]
+	switch sub {
+	case "set":
+		if len(args) < 3 {
+			fmt.Println("Usage: qm configmap set <name> <key=value>...")
+			os.Exit(1)
+		}
+		name := args[1]
+		data := make(map[string]string)
+		for _, kv := range args[2:] {
+			parts := strings.SplitN(kv, "=", 2)
+			if len(parts) != 2 {
+				fmt.Printf("Invalid key=value pair: %s\n", kv)
+				os.Exit(1)
+			}
+			data[parts[0]] = parts[1]
+		}
+
+		body, _ := json.Marshal(map[string]interface{}{"data": data})
+		resp, err := httpPostJSON(daemonSocketPath(), "/v1/configmaps/"+name, body)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(string(resp))
+
+	case "list":
+		// List configmaps from the daemon
+		resp, err := httpGet(daemonSocketPath(), "/v1/configmaps/")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(string(resp))
+
+	default:
+		fmt.Printf("Unknown subcommand: %s\n", sub)
+		fmt.Println("Usage: qm configmap <set|list> ...")
+		os.Exit(1)
+	}
 }
 
 func cmdComponents(args []string) {

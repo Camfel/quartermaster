@@ -7,11 +7,13 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"gopkg.in/yaml.v3"
 
 	"quartermaster/pkg/config"
 	"quartermaster/pkg/cri"
@@ -146,6 +148,72 @@ func startAPI(socketPath string, status *Status, mu *sync.RWMutex, reloadCh chan
 		default:
 			w.WriteHeader(http.StatusTooManyRequests)
 			w.Write([]byte(`{"ok":false,"error":"reconciliation already pending"}`))
+		}
+	})
+
+	// /v1/configmaps/<name> — create or update a ConfigMap (POST)
+	mux.HandleFunc("/v1/configmaps/", func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/v1/configmaps/")
+		if name == "" || strings.Contains(name, "/") {
+			http.Error(w, "bad name", 400)
+			return
+		}
+
+		switch r.Method {
+		case http.MethodPost, http.MethodPut:
+			var body struct {
+				Data map[string]string `json:"data"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON: " + err.Error()})
+				return
+			}
+
+			cm := &types.ConfigMap{
+				Version: "1",
+				Kind:    "ConfigMap",
+				Metadata: types.Metadata{Name: name},
+				Data:    body.Data,
+			}
+
+			path := filepath.Join("/etc/quartermaster/configmaps", name+".yaml")
+			if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+
+			data, _ := yaml.Marshal(cm)
+			if err := os.WriteFile(path, data, 0640); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+
+			// Trigger reconcile to pick up the new ConfigMap.
+			select {
+			case reconcileCh <- struct{}{}:
+			default:
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"ok":      true,
+				"message": "configmap " + name + " saved",
+			})
+
+		case http.MethodGet:
+			// List keys or return full configmap.
+			stack := stackFn()
+			_ = stack // future: return configmap details
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{
+				"name": name,
+			})
+
+		default:
+			http.Error(w, "method not allowed", 405)
 		}
 	})
 
