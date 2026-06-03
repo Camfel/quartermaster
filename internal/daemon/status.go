@@ -1,16 +1,21 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"quartermaster/pkg/config"
 	"quartermaster/pkg/cri"
+	"quartermaster/pkg/types"
 )
 
 // ── Status types ─────────────────────────────────────────────────────────
@@ -37,11 +42,12 @@ type Status struct {
 
 // ContainerStatus is a lightweight snapshot of a managed container.
 type ContainerStatus struct {
-	Name    string `json:"name"`
-	Image   string `json:"image"`
-	Running bool   `json:"running"`
-	PID     uint32 `json:"pid,omitempty"`
-	Healthy *bool  `json:"healthy,omitempty"` // nil = no healthcheck configured
+	Name      string     `json:"name"`
+	Image     string     `json:"image"`
+	Running   bool       `json:"running"`
+	PID       uint32     `json:"pid,omitempty"`
+	Healthy   *bool      `json:"healthy,omitempty"` // nil = no healthcheck configured
+	StartedAt *time.Time `json:"started_at,omitempty"`
 }
 
 // WatcherStatus describes a Git watcher's current state.
@@ -56,10 +62,20 @@ type WatcherStatus struct {
 
 const apiVersion = "0.4.0"
 
-// startAPI listens on a Unix socket and serves the status + component API.
+// startAPI listens on a Unix socket and serves the status, component, WebSocket,
+// and service detail APIs.
 // reloadCh is written to when a client requests a config reload (enable/disable).
 // settingsPath is the path to settings.json, used by /v1/components.
-func startAPI(socketPath string, status *Status, mu *sync.RWMutex, reloadCh chan struct{}, settingsPath string) error {
+// hub is the EventHub for WebSocket subscriptions.
+// stackFn returns the latest merged stack for service detail lookups.
+// logFn maps a service name to its log output.  tail is the number of
+// bytes to fetch (e.g. "4096") or "all" for everything.
+// restartFn stops and deletes a container by service name so the
+// reconciler will redeploy it.
+type logFn func(ctx context.Context, serviceName string, tail string) (string, error)
+type restartFn func(ctx context.Context, serviceName string) error
+
+func startAPI(socketPath string, status *Status, mu *sync.RWMutex, reloadCh chan struct{}, reconcileCh chan struct{}, settingsPath string, hub *EventHub, stackFn func() *types.Stack, logsFn logFn, restartFn restartFn) error {
 	if err := os.MkdirAll(socketPath, 0755); err != nil {
 		return err
 	}
@@ -116,6 +132,23 @@ func startAPI(socketPath string, status *Status, mu *sync.RWMutex, reloadCh chan
 		}
 	})
 
+	// /v1/reconcile — triggers an immediate reconciliation pass
+	mux.HandleFunc("/v1/reconcile", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		select {
+		case reconcileCh <- struct{}{}:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"ok":true,"message":"reconciliation triggered"}`))
+		default:
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"ok":false,"error":"reconciliation already pending"}`))
+		}
+	})
+
 	// /v1/components — list components and their enabled state
 	mux.HandleFunc("/v1/components", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -133,6 +166,138 @@ func startAPI(socketPath string, status *Status, mu *sync.RWMutex, reloadCh chan
 			"components_repo": settings.ComponentsRepo,
 			"components":      settings.Components,
 		})
+	})
+
+	// WebSocket upgrader
+	wsUpgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+
+	// /v1/events — WebSocket stream of daemon events
+	mux.HandleFunc("/v1/events", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := wsUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("WebSocket upgrade failed: %v", err)
+			return
+		}
+
+		sub := hub.Subscribe(conn)
+		defer hub.Unsubscribe(sub)
+
+		// Send initial status snapshot.
+		mu.RLock()
+		s := *status
+		s.Uptime = time.Since(s.StartedAt).Truncate(time.Second).String()
+		if s.Containers == nil {
+			s.Containers = []ContainerStatus{}
+		}
+		if s.Watchers == nil {
+			s.Watchers = []WatcherStatus{}
+		}
+		mu.RUnlock()
+
+		hub.PublishEvent("status", StatusData{
+			Version:            s.Version,
+			StartedAt:          s.StartedAt,
+			Uptime:             s.Uptime,
+			LastReconcile:      s.LastReconcile,
+			LastReconcileError: s.LastReconcileError,
+			ReconcileCount:     s.ReconcileCount,
+			Containers:         s.Containers,
+			Watchers:           s.Watchers,
+			LKGHealthy:         s.LKGHealthy,
+			LKGError:           s.LKGError,
+		})
+
+		// Read loop — keeps the connection alive until client disconnects.
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				break
+			}
+		}
+	})
+
+	// /v1/services/<name> — detailed config for a single service (GET)
+	// /v1/services/<name>/logs — trailing logs for a running service (GET)
+	// /v1/services/<name>/restart — stop + delete container for redeploy (POST)
+	mux.HandleFunc("/v1/services/", func(w http.ResponseWriter, r *http.Request) {
+		// Parse path: /v1/services/<name>[/logs|/restart]
+		path := strings.TrimPrefix(r.URL.Path, "/v1/services/")
+		wantLogs := strings.HasSuffix(path, "/logs")
+		wantRestart := strings.HasSuffix(path, "/restart")
+		name := strings.TrimSuffix(strings.TrimSuffix(path, "/logs"), "/restart")
+		if name == "" || strings.Contains(name, "/") {
+			http.Error(w, "bad service name", 400)
+			return
+		}
+
+		// ── Restart endpoint (POST) ────────────────────────────────
+		if wantRestart {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", 405)
+				return
+			}
+			if restartFn == nil {
+				w.WriteHeader(http.StatusNotImplemented)
+				json.NewEncoder(w).Encode(map[string]string{"error": "restart not configured"})
+				return
+			}
+			if err := restartFn(r.Context(), name); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"ok": "true", "message": "restarting " + name})
+			return
+		}
+
+		// ── Only GET beyond this point ─────────────────────────────
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+
+		// ── Logs endpoint ──────────────────────────────────────────
+		if wantLogs {
+			if logsFn == nil {
+				w.WriteHeader(http.StatusNotImplemented)
+				json.NewEncoder(w).Encode(map[string]string{"error": "log streaming not configured"})
+				return
+			}
+			tail := r.URL.Query().Get("tail")
+			if tail == "" {
+				tail = "4096" // default: last 4KB
+			}
+			logText, err := logsFn(r.Context(), name, tail)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.Write([]byte(logText))
+			return
+		}
+
+		// ── Service config endpoint ────────────────────────────────
+		stack := stackFn()
+		if stack == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"error": "no stack loaded yet"})
+			return
+		}
+
+		for _, svc := range stack.Spec.Services {
+			if svc.Name == name {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(svc)
+				return
+			}
+		}
+
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "service not found"})
 	})
 
 	srv := &http.Server{Handler: mux}
@@ -180,14 +345,26 @@ func recordContainers(status *Status, mu *sync.RWMutex, containers []cri.Contain
 }
 
 // updateContainerHealth sets running + pid for a single container.
+// Tracks the first time a container becomes running or gets a new PID.
 func updateContainerHealth(status *Status, mu *sync.RWMutex, name string, running bool, pid uint32) {
 	mu.Lock()
 	defer mu.Unlock()
 
+	now := time.Now()
 	for i := range status.Containers {
 		if status.Containers[i].Name == name {
+			wasRunning := status.Containers[i].Running
+			oldPID := status.Containers[i].PID
 			status.Containers[i].Running = running
 			status.Containers[i].PID = pid
+
+			// Record start time when container first starts or restarts.
+			if running && (!wasRunning || (pid != oldPID)) {
+				status.Containers[i].StartedAt = &now
+			}
+			if !running {
+				status.Containers[i].StartedAt = nil
+			}
 			return
 		}
 	}

@@ -40,4 +40,8 @@ type ContainerClient interface {
 	// GetContainerPID returns the PID of the container's main task, or 0 if not running.
 	// Used for network namespace sharing (VPN sidecar pattern).
 	GetContainerPID(ctx context.Context, containerID string) (uint32, error)
+
+	// ContainerLogs returns the trailing logs for a running container.
+	// tail is the number of lines to fetch (e.g. "100").  Use "all" for the full log.
+	ContainerLogs(ctx context.Context, containerID string, tail string) (string, error)
 }

@@ -36,6 +36,10 @@ type Daemon struct {
 
 	consecutiveFailures map[string]int
 	maxFailures         int
+
+	eventHub     *EventHub
+	latestStack   *types.Stack
+	latestStackMu sync.RWMutex
 }
 
 // NewDaemon initializes a new Daemon instance.
@@ -67,6 +71,7 @@ func NewDaemon(
 		reloadCh:            make(chan struct{}, 1),
 		consecutiveFailures: make(map[string]int),
 		maxFailures:         maxFailures,
+		eventHub:            NewEventHub(),
 		status: &Status{
 			Version:   apiVersion,
 			StartedAt: time.Now(),
@@ -93,7 +98,44 @@ func (d *Daemon) Run(ctx context.Context) error {
 	log.Printf("Daemon loop started. Sync interval: %v, %d repo(s)", d.syncInterval, len(d.watchers))
 
 	// ── Start status API ────────────────────────────────────────────
-	if err := startAPI(d.socketPath, d.status, d.statusMu, d.reloadCh, d.settingsPath); err != nil {
+	// Build a log lookup closure that maps service name → container logs.
+	logLookup := func(ctx context.Context, serviceName string, tail string) (string, error) {
+		containers, err := d.containerClient.ListContainers(ctx)
+		if err != nil {
+			return "", fmt.Errorf("failed to list containers: %w", err)
+		}
+		for _, c := range containers {
+			if c.Name == serviceName {
+				return d.containerClient.ContainerLogs(ctx, c.ID, tail)
+			}
+		}
+		return "", fmt.Errorf("container for service %q not found", serviceName)
+	}
+
+	// Build a restart closure that stops + deletes a container by name.
+	// The reconciler will detect the missing container and redeploy it.
+	restartService := func(ctx context.Context, serviceName string) error {
+		containers, err := d.containerClient.ListContainers(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to list containers: %w", err)
+		}
+		for _, c := range containers {
+			if c.Name == serviceName {
+				log.Printf("Restart requested for %s (container %s)", serviceName, c.ID)
+				if err := d.containerClient.StopContainer(ctx, c.ID); err != nil {
+					log.Printf("Warning: stop failed for %s: %v", serviceName, err)
+				}
+				if err := d.containerClient.DeleteContainer(ctx, c.ID); err != nil {
+					return fmt.Errorf("delete failed for %s: %w", serviceName, err)
+				}
+				d.TriggerReconcile()
+				return nil
+			}
+		}
+		return fmt.Errorf("container for service %q not found", serviceName)
+	}
+
+	if err := startAPI(d.socketPath, d.status, d.statusMu, d.reloadCh, d.reconcileChan, d.settingsPath, d.eventHub, d.latestStackSnapshot, logLookup, restartService); err != nil {
 		log.Printf("Warning: status API failed to start: %v", err)
 	}
 
@@ -148,13 +190,30 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 	defer cancel()
 
 	stack, err := d.loadMergedStack()
-	recordReconcile(d.status, d.statusMu, err)
 	if err != nil {
+		recordReconcile(d.status, d.statusMu, err)
+		d.eventHub.PublishEvent("reconcile", ReconcileData{
+			Success: false,
+			Error:   err.Error(),
+			Count:   d.status.ReconcileCount + 1,
+		})
 		return fmt.Errorf("failed to load desired state: %w", err)
 	}
 
+	// Store the latest stack for service detail lookups.
+	d.latestStackMu.Lock()
+	d.latestStack = stack
+	d.latestStackMu.Unlock()
+
 	err = d.reconciler.ReconcileStack(reconCtx, stack)
 	recordReconcile(d.status, d.statusMu, err)
+
+	d.eventHub.PublishEvent("reconcile", ReconcileData{
+		Success: err == nil,
+		Error:   func() string { if err != nil { return err.Error() }; return "" }(),
+		Count:   d.status.ReconcileCount,
+	})
+
 	if err != nil {
 		log.Printf("Reconciliation failed: %v", err)
 
@@ -189,6 +248,9 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 			updateContainerHealth(d.status, d.statusMu, c.Name, pidErr == nil && pid > 0, pid)
 		}
 	}
+
+	// Publish full status snapshot to WebSocket subscribers.
+	d.publishStatusEvent()
 
 	return nil
 }
@@ -273,6 +335,13 @@ func (d *Daemon) runHealthChecks(ctx context.Context) {
 		}
 
 		result := d.healthChecker.RunCheck(svc)
+
+		d.eventHub.PublishEvent("health", HealthData{
+			Service: svc.Name,
+			Healthy: result.Healthy,
+			Type:    result.Type,
+			Error:   func() string { if result.Error != nil { return result.Error.Error() }; return "" }(),
+		})
 
 		if result.Healthy {
 			if d.consecutiveFailures[svc.Name] > 0 {
@@ -371,4 +440,38 @@ func (d *Daemon) TriggerReconcile() {
 	case d.reconcileChan <- struct{}{}:
 	default:
 	}
+}
+
+// publishStatusEvent sends the full daemon status to WebSocket subscribers.
+func (d *Daemon) publishStatusEvent() {
+	d.statusMu.RLock()
+	s := *d.status
+	s.Uptime = time.Since(s.StartedAt).Truncate(time.Second).String()
+	if s.Containers == nil {
+		s.Containers = []ContainerStatus{}
+	}
+	if s.Watchers == nil {
+		s.Watchers = []WatcherStatus{}
+	}
+	d.statusMu.RUnlock()
+
+	d.eventHub.PublishEvent("status", StatusData{
+		Version:            s.Version,
+		StartedAt:          s.StartedAt,
+		Uptime:             s.Uptime,
+		LastReconcile:      s.LastReconcile,
+		LastReconcileError: s.LastReconcileError,
+		ReconcileCount:     s.ReconcileCount,
+		Containers:         s.Containers,
+		Watchers:           s.Watchers,
+		LKGHealthy:         s.LKGHealthy,
+		LKGError:           s.LKGError,
+	})
+}
+
+// latestStackSnapshot returns a copy of the current merged stack (thread-safe).
+func (d *Daemon) latestStackSnapshot() *types.Stack {
+	d.latestStackMu.RLock()
+	defer d.latestStackMu.RUnlock()
+	return d.latestStack
 }

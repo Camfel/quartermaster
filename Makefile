@@ -1,59 +1,78 @@
 # Quartermaster Development Makefile
+#
+# Standard workflow:
+#   make          → fmt + vet + test + build (CI gate)
+#   make restart  → build + restart the systemd daemon (dev loop)
+#   make install  → build + deploy to /usr/local/bin + systemd
 
-.PHONY: all tidy fmt vet test build clean install install-local uninstall integration-test
+.PHONY: all fmt vet test build clean install uninstall restart release \
+        integration-test setup-deploy-key \
+        dev-up dev-shell dev-test dev-integration-test dev-down
 
-# Default target
-all: fmt vet build
+BIN_DIR      ?= bin
+QM_BIN       ?= $(BIN_DIR)/qm
+DAEMON_BIN   ?= $(BIN_DIR)/qm-daemon
+INSTALL_DIR  ?= /usr/local/bin
+CONFIG_DIR   ?= /etc/quartermaster
+SYSTEMD_DIR  ?= /etc/systemd/system
+QM_USER      ?= quartermaster
+CONTAINERD_SOCK ?= /run/containerd/containerd.sock
 
-# Clean up dependencies
-tidy:
-	go mod tidy
+# ── Development pipeline ─────────────────────────────────────────────────
 
-# Format code
+# Default: full CI gate.
+all: fmt vet test build
+
+# Format + vet only (fast pre-commit check).
+check: fmt vet
+	@echo "✓ Format + vet passed"
+
 fmt:
 	go fmt ./...
 
-# Static analysis
 vet:
 	go vet ./...
 
-# Run all unit tests
+# Unit tests (excludes integration tests).
 test:
-	go test -v -count=1 ./...
+	go test -v -count=1 ./pkg/...
 
-# Build binaries into the ./bin directory
+# Optimised debug build (keeps symbol tables for profiling).
 build:
-	@mkdir -p bin
-	@echo "Building qm CLI..."
-	go build -o bin/qm ./cmd/qm
-	@echo "Building qm-daemon..."
-	go build -o bin/qm-daemon ./cmd/qm-daemon
+	@mkdir -p $(BIN_DIR)
+	go build -trimpath -o $(QM_BIN) ./cmd/qm
+	go build -trimpath -o $(DAEMON_BIN) ./cmd/qm-daemon
+	@echo "✓ Binaries: $(QM_BIN)  $(DAEMON_BIN)"
 
-# Clean build artifacts
+# Stripped production build.
+release:
+	@mkdir -p $(BIN_DIR)
+	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $(QM_BIN) ./cmd/qm
+	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $(DAEMON_BIN) ./cmd/qm-daemon
+	@echo "✓ Release binaries: $(QM_BIN)  $(DAEMON_BIN)"
+
+# Build + restart the running systemd daemon (dev loop).
+restart: build
+	systemctl stop qm-daemon
+	cp $(DAEMON_BIN) $(INSTALL_DIR)/qm-daemon
+	systemctl start qm-daemon
+	@echo "✓ Daemon restarted"
+
 clean:
-	@echo "Cleaning..."
-	rm -rf bin/
+	rm -rf $(BIN_DIR)/
 	go clean
 
-# Install binaries to a local bin folder for testing
-install-local: build
-	@echo "Installing binaries to ./bin/..."
-	@echo "Done. You can now run ./bin/qm"
+tidy:
+	go mod tidy
 
 # ── System-wide installation ─────────────────────────────────────────────
-INSTALL_DIR   ?= /usr/local/bin
-CONFIG_DIR    ?= /etc/quartermaster
-SYSTEMD_DIR   ?= /etc/systemd/system
-QM_USER       ?= quartermaster
-CONTAINERD_SOCK ?= /run/containerd/containerd.sock
 
-# Install Quartermaster on the host: copies binaries, creates the dedicated
-# system user with least privilege, configures permissions, and installs the
-# systemd service.  Idempotent — safe to run repeatedly.
+# Full install: build, copy binaries, configure user, set permissions,
+# install systemd unit.  Idempotent — safe to run repeatedly.
 install: build
 	@echo "==> Installing Quartermaster to $(INSTALL_DIR)..."
-	install -m 755 bin/qm $(INSTALL_DIR)/qm
-	install -m 755 bin/qm-daemon $(INSTALL_DIR)/qm-daemon
+	install -m 755 $(QM_BIN) $(INSTALL_DIR)/qm
+	install -m 755 $(DAEMON_BIN) $(INSTALL_DIR)/qm-daemon
 	@echo "    Binaries installed."
 	@echo "==> Ensuring acl is available..."
 	@command -v setfacl >/dev/null 2>&1 || { \
@@ -78,7 +97,6 @@ install: build
 	@echo "==> Setting ownership on $(CONFIG_DIR)..."
 	chown $(QM_USER):$(QM_USER) $(CONFIG_DIR)
 	chmod 750 $(CONFIG_DIR)
-	@# Fix permissions on any pre-existing files (idempotent).
 	@for f in $(CONFIG_DIR)/master.key $(CONFIG_DIR)/settings.json; do \
 		if [ -f "$$f" ]; then \
 			chown $(QM_USER):$(QM_USER) "$$f"; \
@@ -137,24 +155,25 @@ uninstall:
 	@echo "Config and user kept at $(CONFIG_DIR) and $(QM_USER)."
 	@echo "To remove them:  sudo rm -rf $(CONFIG_DIR) && sudo userdel $(QM_USER)"
 
-# Set up an SSH deploy key for a GitHub repo (requires gh CLI).
-# Usage: make setup-deploy-key REPO=my-org/quartermaster-stacks
-setup-deploy-key:
-	@./scripts/setup-deploy-key.sh --repo $(REPO)
+# ── Integration tests ────────────────────────────────────────────────────
 
-# Run end-to-end integration tests (requires containerd running on the host)
+# Requires containerd running on the host.
 integration-test: build
 	@echo "=== Running Quartermaster end-to-end integration tests ==="
 	@echo "Prerequisites: containerd must be running on this host"
-	@echo ""
 	go test -v -tags=integration -count=1 -timeout 180s ./internal/daemon/
 
-# ── Dev container (isolated Debian environment for QM development) ────────
+# ── Git operations ───────────────────────────────────────────────────────
+
+# Set up an SSH deploy key for a GitHub repo (requires gh CLI).
+setup-deploy-key:
+	@./scripts/setup-deploy-key.sh --repo $(REPO)
+
+# ── Dev container ────────────────────────────────────────────────────────
+
 DEV_IMAGE    ?= docker.io/library/debian:bookworm-slim
 DEV_NAME     ?= qm-dev
-DEV_NAMESPACE ?= quartermaster-dev
 
-# Pull the base image and create the dev container (run once).
 dev-up:
 	@echo "==> Pulling $(DEV_IMAGE)..."
 	ctr image pull $(DEV_IMAGE)
@@ -170,22 +189,17 @@ dev-up:
 	@echo "==> Running setup script..."
 	ctr task exec --exec-id setup $(DEV_NAME) bash /workspace/scripts/dev-setup.sh || true
 	@echo ""
-	@echo "Dev container ready!  Enter with: make dev-shell"
-	@echo "Or run tests:       make dev-test"
+	@echo "Dev container ready.  Enter with: make dev-shell"
 
-# Open a shell inside the running dev container.
 dev-shell:
 	ctr task exec -t --exec-id shell-$$(date +%s) $(DEV_NAME) bash -c 'cd /workspace && export PATH=/usr/local/go/bin:$$PATH && exec bash'
 
-# Run unit tests inside the dev container.
 dev-test:
-	ctr task exec --exec-id test-$$(date +%s) $(DEV_NAME) bash -c 'cd /workspace && export PATH=/usr/local/go/bin:$$PATH && make build && make test'
+	ctr task exec --exec-id test-$$(date +%s) $(DEV_NAME) bash -c 'cd /workspace && export PATH=/usr/local/go/bin:$$PATH && make all'
 
-# Run integration tests inside the dev container.
 dev-integration-test:
 	ctr task exec --exec-id itest-$$(date +%s) $(DEV_NAME) bash -c 'cd /workspace && export PATH=/usr/local/go/bin:$$PATH && make integration-test'
 
-# Stop and remove the dev container.
 dev-down:
 	-ctr task kill -s SIGKILL $(DEV_NAME) 2>/dev/null || true
 	-ctr task delete $(DEV_NAME) 2>/dev/null || true

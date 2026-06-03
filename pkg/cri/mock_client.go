@@ -145,3 +145,14 @@ func (m *MockContainerClient) GetContainerPID(ctx context.Context, containerID s
 	// Return a mock PID (non-zero means running)
 	return 1000, nil
 }
+
+// ContainerLogs implements the ContainerClient interface.
+func (m *MockContainerClient) ContainerLogs(ctx context.Context, containerID string, tail string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.containers[containerID]; !ok {
+		return "", fmt.Errorf("container %s not found", containerID)
+	}
+	return "[mock logs for " + containerID + "]\n", nil
+}

@@ -20,65 +20,72 @@ type StackSpec struct {
 
 // Service defines an individual workload/container to be managed.
 type Service struct {
-	Name           string            `yaml:"name"`
-	Image          string            `yaml:"image"`
-	RestartPolicy  string            `yaml:"restart_policy"`
-	Ports          []Port            `yaml:"ports,omitempty"`
-	Volumes        []Volume          `yaml:"volumes,omitempty"`
-	Resources      *Resources        `yaml:"resources,omitempty"`
-	Env            []EnvVar          `yaml:"env,omitempty"`
-	Secrets        []SecretRef       `yaml:"secrets,omitempty"`
-	Network        string            `yaml:"network,omitempty"`
-	User           string            `yaml:"user,omitempty"`
-	DependsOn      []string          `yaml:"depends_on,omitempty"`
-	HealthCheck    *HealthCheck      `yaml:"healthcheck,omitempty"`
+	Name           string            `yaml:"name"            json:"name"`
+	Image          string            `yaml:"image"           json:"image"`
+	RestartPolicy  string            `yaml:"restart_policy"  json:"restart_policy"`
+	Ports          []Port            `yaml:"ports,omitempty" json:"ports,omitempty"`
+	Volumes        []Volume          `yaml:"volumes,omitempty" json:"volumes,omitempty"`
+	Resources      *Resources        `yaml:"resources,omitempty" json:"resources,omitempty"`
+	Env            []EnvVar          `yaml:"env,omitempty"   json:"env,omitempty"`
+	Secrets        []SecretRef       `yaml:"secrets,omitempty" json:"secrets,omitempty"`
+	Network        string            `yaml:"network,omitempty" json:"network,omitempty"`
+	User           string            `yaml:"user,omitempty"  json:"user,omitempty"`
+	DependsOn      []string          `yaml:"depends_on,omitempty" json:"depends_on,omitempty"`
+	HealthCheck    *HealthCheck      `yaml:"healthcheck,omitempty" json:"healthcheck,omitempty"`
 
 	// ConfigHash is an internal field set by the reconciler for change detection.
-	// It is not serialized to YAML.
+	// It is not serialized to YAML or JSON.
 	ConfigHash string `yaml:"-" json:"-"`
 }
 
 // Port defines a port mapping between host and container.
 type Port struct {
-	Host      int    `yaml:"host"`
-	Container int    `yaml:"container"`
-	Protocol  string `yaml:"protocol,omitempty"` // "tcp", "udp", "sctp". Default "tcp" when empty.
+	Host      int    `yaml:"host"      json:"host"`
+	Container int    `yaml:"container" json:"container"`
+	Protocol  string `yaml:"protocol,omitempty" json:"protocol,omitempty"`
 }
 
 // Volume defines a volume mapping.
 type Volume struct {
-	Source string `yaml:"source"`
-	Target string `yaml:"target"`
-	Type   string `yaml:"type"` // e.g., bind, volume
+	Source string `yaml:"source" json:"source"`
+	Target string `yaml:"target" json:"target"`
+	Type   string `yaml:"type"   json:"type"`
 }
 
 // Resources defines hardware constraints for a service.
 type Resources struct {
-	GPU *GPUResource `yaml:"gpu,omitempty"`
+	GPU *GPUResource `yaml:"gpu,omitempty" json:"gpu,omitempty"`
 }
 
 // GPUResource defines GPU requirements.
 type GPUResource struct {
-	Type string `yaml:"type"` // e.g., nvidia
-	ID   string `yaml:"id"`   // e.g., "all" or a specific UUID
+	Type string `yaml:"type" json:"type"`
+	ID   string `yaml:"id"   json:"id"`
 }
 
-// EnvVar defines an environment variable.
+// EnvVar defines an environment variable.  Either Value (literal) or
+// ValueFrom (secret reference) must be set.
 type EnvVar struct {
-	Name  string `yaml:"name"`
-	Value string `yaml:"value"`
+	Name      string          `yaml:"name"                json:"name"`
+	Value     string          `yaml:"value,omitempty"     json:"value,omitempty"`
+	ValueFrom *EnvValueSource  `yaml:"valueFrom,omitempty" json:"valueFrom,omitempty"`
+}
+
+// EnvValueSource references a quartermaster secret to inject as an env var.
+type EnvValueSource struct {
+	SecretRef string `yaml:"secretRef" json:"secretRef"`
 }
 
 // SecretRef defines a reference to a secret managed by quartermaster.
 type SecretRef struct {
-	Name      string `yaml:"name"`
-	SecretRef string `yaml:"secret_ref"`
+	Name      string `yaml:"name"       json:"name"`
+	SecretRef string `yaml:"secret_ref" json:"secret_ref"`
 }
 
 // HealthCheck defines how to verify if a service is running correctly.
 type HealthCheck struct {
-	Type     string `yaml:"type"` // e.g., http, tcp, exec
-	Path     string `yaml:"path,omitempty"`
-	Port     int    `yaml:"port,omitempty"`
-	Interval string `yaml:"interval"`
+	Type     string `yaml:"type"               json:"type"`
+	Path     string `yaml:"path,omitempty"      json:"path,omitempty"`
+	Port     int    `yaml:"port,omitempty"      json:"port,omitempty"`
+	Interval string `yaml:"interval"            json:"interval"`
 }

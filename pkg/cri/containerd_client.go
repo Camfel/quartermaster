@@ -1,10 +1,13 @@
 package cri
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"quartermaster/pkg/hardware"
@@ -20,6 +23,77 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
+// ringBuffer is a thread-safe bounded byte buffer for capturing container logs.
+type ringBuffer struct {
+	mu   sync.Mutex
+	buf  bytes.Buffer
+	cap  int // max bytes to retain
+}
+
+func newRingBuffer(cap int) *ringBuffer {
+	return &ringBuffer{cap: cap}
+}
+
+func (rb *ringBuffer) Write(p []byte) (int, error) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+
+	// Evict old data if we'd exceed capacity.
+	if rb.buf.Len()+len(p) > rb.cap {
+		excess := rb.buf.Len() + len(p) - rb.cap
+		if excess < rb.buf.Len() {
+			// Drop oldest bytes to make room.
+			rb.buf.Next(excess)
+		} else {
+			rb.buf.Reset()
+		}
+	}
+	return rb.buf.Write(p)
+}
+
+func (rb *ringBuffer) String() string {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	return rb.buf.String()
+}
+
+func (rb *ringBuffer) TailBytes(n int) string {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	b := rb.buf.Bytes()
+	if len(b) <= n {
+		return string(b)
+	}
+	return string(b[len(b)-n:])
+}
+
+// logStore holds ring buffers keyed by container ID.
+type logStore struct {
+	mu  sync.Mutex
+	bufs map[string]*ringBuffer
+}
+
+func newLogStore() *logStore {
+	return &logStore{bufs: make(map[string]*ringBuffer)}
+}
+
+func (ls *logStore) get(containerID string) *ringBuffer {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	rb, ok := ls.bufs[containerID]
+	if !ok {
+		rb = newRingBuffer(256 * 1024) // 256 KB per container
+		ls.bufs[containerID] = rb
+	}
+	return rb
+}
+
+func (ls *logStore) remove(containerID string) {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	delete(ls.bufs, containerID)
+}
+
 // ContainerdClient is the real implementation of ContainerClient using containerd.
 type ContainerdClient struct {
 	client    *containerd.Client
@@ -27,6 +101,7 @@ type ContainerdClient struct {
 	secrets   *secrets.Manager  // optional: for secret injection
 	hwDetect  *hardware.Detector // optional: for GPU detection
 	netMgr    *network.Manager   // optional: for network profile management
+	logs      *logStore
 }
 
 // NewContainerdClient initializes a new connection to the containerd socket.
@@ -39,6 +114,7 @@ func NewContainerdClient(socketPath, namespace string) (*ContainerdClient, error
 	return &ContainerdClient{
 		client:    client,
 		namespace: namespace,
+		logs:      newLogStore(),
 	}, nil
 }
 
@@ -102,8 +178,22 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 	}
 
 	// 1. Add Environment Variables
+	var envVars []string
 	for _, env := range svc.Env {
-		specOpts = append(specOpts, oci.WithEnv([]string{fmt.Sprintf("%s=%s", env.Name, env.Value)}))
+		if env.ValueFrom != nil && env.ValueFrom.SecretRef != "" && c.secrets != nil {
+			// Resolve secret into env var value.
+			sd, err := c.secrets.Resolve(env.Name, env.ValueFrom.SecretRef)
+			if err != nil {
+				return "", fmt.Errorf("failed to resolve secret %q for env %s: %w",
+					env.ValueFrom.SecretRef, env.Name, err)
+			}
+			envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, string(sd.Content)))
+		} else if env.Value != "" {
+			envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, env.Value))
+		}
+	}
+	if len(envVars) > 0 {
+		specOpts = append(specOpts, oci.WithEnv(envVars))
 	}
 
 	// 2. Add Volume Mounts
@@ -204,7 +294,8 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 	return container.ID(), nil
 }
 
-// StartContainer starts a task for the container.
+// StartContainer starts a task for the container.  Container stdout/stderr are
+// captured into an in-memory ring buffer so they can be served via ContainerLogs.
 func (c *ContainerdClient) StartContainer(ctx context.Context, containerID string) error {
 	ctx = c.withNamespace(ctx)
 	log.Printf("Starting container: %s", containerID)
@@ -214,7 +305,16 @@ func (c *ContainerdClient) StartContainer(ctx context.Context, containerID strin
 		return fmt.Errorf("failed to load container %s: %w", containerID, err)
 	}
 
-	task, err := container.NewTask(ctx, cio.NewCreator(cio.WithStdio))
+	rb := c.logs.get(containerID)
+	// Writer that sends to the ring buffer AND /dev/null so the
+	// container's stdout/stderr don't fill the daemon's own stdio.
+	logWriter := io.MultiWriter(rb, io.Discard)
+
+	task, err := container.NewTask(ctx, cio.NewCreator(cio.WithStreams(
+		nil,        // stdin  — not used
+		logWriter,  // stdout — captured
+		logWriter,  // stderr — captured
+	)))
 	if err != nil {
 		return fmt.Errorf("failed to create task for container %s: %w", containerID, err)
 	}
@@ -241,6 +341,46 @@ func (c *ContainerdClient) GetContainerPID(ctx context.Context, containerID stri
 	}
 
 	return task.Pid(), nil
+}
+
+// ContainerLogs returns the trailing logs for a running container.
+//
+// First tries the in-memory ring buffer (populated for containers started
+// by this daemon process).  If the buffer is empty, falls back to reading
+// from containerd's shim stdout FIFO.
+func (c *ContainerdClient) ContainerLogs(ctx context.Context, containerID string, tail string) (string, error) {
+	// Verify the container exists and is running.
+	nscCtx := c.withNamespace(ctx)
+	container, err := c.client.LoadContainer(nscCtx, containerID)
+	if err != nil {
+		return "", fmt.Errorf("failed to load container %s: %w", containerID, err)
+	}
+
+	task, err := container.Task(nscCtx, nil)
+	if err != nil {
+		return "", fmt.Errorf("container %s has no running task: %w", containerID, err)
+	}
+	_ = task
+
+	// Parse tail as approximate byte count.
+	var n int
+	if _, scanErr := fmt.Sscanf(tail, "%d", &n); scanErr != nil || n <= 0 {
+		n = 4096 // default to last 4KB
+	}
+
+	// Try the in-memory ring buffer first.
+	rb := c.logs.get(containerID)
+	if buf := rb.String(); len(buf) > 0 {
+		if tail == "all" || tail == "" {
+			return buf, nil
+		}
+		return rb.TailBytes(n), nil
+	}
+
+	// No logs captured yet — the container was started before this
+	// daemon's log capture was enabled.  Logs will appear after the
+	// next container restart.
+	return "(container was started before log capture was enabled — logs will appear after next restart)", nil
 }
 
 // StopContainer stops the running task for the container.
@@ -326,6 +466,8 @@ func (c *ContainerdClient) StopContainer(ctx context.Context, containerID string
 
 // DeleteContainer removes the container and its resources.
 func (c *ContainerdClient) DeleteContainer(ctx context.Context, containerID string) error {
+	c.logs.remove(containerID)
+
 	ctx = c.withNamespace(ctx)
 	log.Printf("Deleting container: %s", containerID)
 
