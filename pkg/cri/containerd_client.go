@@ -195,39 +195,40 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 		specOpts = append(specOpts, oci.WithHostNamespace(specs.NetworkNamespace))
 	}
 
-	// 1. Add Environment Variables
+	// 1. Add Environment Variables.
+	//    Resolution order: secret > configmap > plain value (fallback).
 	var envVars []string
 	for _, env := range svc.Env {
+		resolved := false
+
 		if env.ValueFrom != nil {
-			// ── Secret reference ──────────────────────────────────
+			// ── Secret reference (highest priority) ───────────────
 			if env.ValueFrom.SecretRef != "" && c.secrets != nil {
 				sd, err := c.secrets.Resolve(env.Name, env.ValueFrom.SecretRef)
-				if err != nil {
-					return "", fmt.Errorf("failed to resolve secret %q for env %s: %w",
-						env.ValueFrom.SecretRef, env.Name, err)
+				if err == nil {
+					envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, string(sd.Content)))
+					resolved = true
 				}
-				envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, string(sd.Content)))
-				continue
+				// If secret not found, fall through to configmap/value.
 			}
 
-			// ── ConfigMap reference ───────────────────────────────
-			if env.ValueFrom.ConfigMapRef != "" && c.configMgr != nil {
+			// ── ConfigMap reference (overrides value) ─────────────
+			if !resolved && env.ValueFrom.ConfigMapRef != "" && c.configMgr != nil {
 				key := env.ValueFrom.Key
 				if key == "" {
 					key = env.Name // default: key name == env var name
 				}
 				val, err := c.configMgr.resolve(env.ValueFrom.ConfigMapRef, key)
-				if err != nil {
-					return "", fmt.Errorf("failed to resolve configmap %q key %q for env %s: %w",
-						env.ValueFrom.ConfigMapRef, key, env.Name, err)
+				if err == nil {
+					envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, val))
+					resolved = true
 				}
-				envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, val))
-				continue
+				// If configmap key not found, fall through to plain value.
 			}
 		}
 
-		// ── Plain value ────────────────────────────────────────────
-		if env.Value != "" {
+		// ── Plain value (built-in default, used as fallback) ────────
+		if !resolved && env.Value != "" {
 			envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, env.Value))
 		}
 	}

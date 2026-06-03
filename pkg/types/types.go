@@ -70,12 +70,13 @@ type GPUResource struct {
 	ID   string `yaml:"id"   json:"id"`
 }
 
-// EnvVar defines an environment variable.  Either Value (literal) or
-// ValueFrom (secret reference) must be set.
+// EnvVar defines an environment variable.  Value is the default.
+// ValueFrom (secret or configmap ref) overrides Value when the
+// referenced source exists and the key is found.
 type EnvVar struct {
 	Name      string          `yaml:"name"                json:"name"`
 	Value     string          `yaml:"value,omitempty"     json:"value,omitempty"`
-	ValueFrom *EnvValueSource  `yaml:"valueFrom,omitempty" json:"valueFrom,omitempty"`
+	ValueFrom *EnvValueSource `yaml:"valueFrom,omitempty" json:"valueFrom,omitempty"`
 }
 
 // EnvValueSource references a Secret or ConfigMap key to inject as an env var.
