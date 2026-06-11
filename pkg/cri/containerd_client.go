@@ -27,9 +27,9 @@ import (
 
 // ringBuffer is a thread-safe bounded byte buffer for capturing container logs.
 type ringBuffer struct {
-	mu   sync.Mutex
-	buf  bytes.Buffer
-	cap  int // max bytes to retain
+	mu  sync.Mutex
+	buf bytes.Buffer
+	cap int // max bytes to retain
 }
 
 func newRingBuffer(cap int) *ringBuffer {
@@ -40,11 +40,9 @@ func (rb *ringBuffer) Write(p []byte) (int, error) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
-	// Evict old data if we'd exceed capacity.
 	if rb.buf.Len()+len(p) > rb.cap {
 		excess := rb.buf.Len() + len(p) - rb.cap
 		if excess < rb.buf.Len() {
-			// Drop oldest bytes to make room.
 			rb.buf.Next(excess)
 		} else {
 			rb.buf.Reset()
@@ -71,7 +69,7 @@ func (rb *ringBuffer) TailBytes(n int) string {
 
 // logStore holds ring buffers keyed by container ID.
 type logStore struct {
-	mu  sync.Mutex
+	mu   sync.Mutex
 	bufs map[string]*ringBuffer
 }
 
@@ -100,9 +98,9 @@ func (ls *logStore) remove(containerID string) {
 type ContainerdClient struct {
 	client    *containerd.Client
 	namespace string
-	secrets   *secrets.Manager   // optional: for secret injection
-	hwDetect  *hardware.Detector  // optional: for GPU detection
-	netMgr    *network.Manager    // optional: for network profile management
+	secrets   *secrets.Manager     // optional: for secret injection
+	hwDetect  *hardware.Detector   // optional: for GPU detection
+	netMgr    network.NetManager   // network: bridge, IPAM, port forwarding, VPN routing
 	configMgr *configManagerLookup // optional: for ConfigMap resolution
 	logs      *logStore
 }
@@ -148,8 +146,9 @@ func (c *ContainerdClient) WithHardwareDetector(hd *hardware.Detector) *Containe
 	return c
 }
 
-// WithNetworkManager sets the network manager for network profile support.
-func (c *ContainerdClient) WithNetworkManager(nm *network.Manager) *ContainerdClient {
+// WithNetManager sets the network manager for bridge, IPAM, port forwarding,
+// and VPN policy routing.
+func (c *ContainerdClient) WithNetManager(nm network.NetManager) *ContainerdClient {
 	c.netMgr = nm
 	return c
 }
@@ -162,14 +161,35 @@ func (c *ContainerdClient) withNamespace(ctx context.Context) context.Context {
 // PullImage pulls an image from the registry.
 func (c *ContainerdClient) PullImage(ctx context.Context, ref string) (string, error) {
 	ctx = c.withNamespace(ctx)
-	log.Printf("Pulling image: %s", ref)
-	
-	image, err := c.client.Pull(ctx, ref, containerd.WithPullUnpack)
+
+	fullRef := qualifyImageRef(ref)
+
+	log.Printf("Pulling image: %s", fullRef)
+
+	image, err := c.client.Pull(ctx, fullRef, containerd.WithPullUnpack)
 	if err != nil {
-		return "", fmt.Errorf("failed to pull image %s: %w", ref, err)
+		return "", fmt.Errorf("failed to pull image %s: %w", fullRef, err)
 	}
 
 	return image.Name(), nil
+}
+
+// qualifyImageRef adds docker.io/ prefix and :latest tag if missing.
+func qualifyImageRef(ref string) string {
+	parts := strings.SplitN(ref, "/", 3)
+	if len(parts) >= 2 && (strings.Contains(parts[0], ".") || strings.Contains(parts[0], ":")) {
+		return ref
+	}
+	if len(parts) == 1 {
+		if !strings.Contains(ref, ":") {
+			return "docker.io/library/" + ref + ":latest"
+		}
+		return "docker.io/library/" + ref
+	}
+	if !strings.Contains(ref, ":") {
+		return "docker.io/" + ref + ":latest"
+	}
+	return "docker.io/" + ref
 }
 
 // CreateContainer creates a new container based on the service specification.
@@ -187,47 +207,62 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 		oci.WithImageConfig(image),
 	}
 
-	// 0. Network: by default, use host networking (appropriate for a
-	//    single-host homelab orchestrator).  The "internal" profile
-	//    isolates the container in its own network namespace.
-	netProfile := strings.ToLower(svc.Network)
-	if netProfile != "internal" {
-		specOpts = append(specOpts, oci.WithHostNamespace(specs.NetworkNamespace))
+	// If the service specifies a command, override the image's entrypoint.
+	if len(svc.Command) > 0 {
+		specOpts = append(specOpts, oci.WithProcessArgs(svc.Command...))
 	}
 
-	// 1. Add Environment Variables.
-	//    Resolution order: secret > configmap > plain value (fallback).
+	// ── 0. Network profile routing ─────────────────────────────────
+	//    public   (or empty) → host networking
+	//    internal            → own netns, bridge, no host ports exposed
+	//    vpn                 → own netns, bridge, CAP_NET_ADMIN, optional VPN policy routing
+	netProfile := strings.ToLower(svc.Network)
+	useHostNet := true
+	switch netProfile {
+	case "internal", "vpn":
+		useHostNet = false
+	}
+
+	if useHostNet {
+		specOpts = append(specOpts, oci.WithHostNamespace(specs.NetworkNamespace))
+	}
+	if netProfile == "vpn" {
+		specOpts = append(specOpts, oci.WithAddedCapabilities([]string{"CAP_NET_ADMIN"}))
+	}
+
+	// ── 1. Add Environment Variables ───────────────────────────────
 	var envVars []string
 	for _, env := range svc.Env {
 		resolved := false
 
 		if env.ValueFrom != nil {
-			// ── Secret reference (highest priority) ───────────────
 			if env.ValueFrom.SecretRef != "" && c.secrets != nil {
 				sd, err := c.secrets.Resolve(env.Name, env.ValueFrom.SecretRef)
 				if err == nil {
 					envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, string(sd.Content)))
 					resolved = true
+					log.Printf("Injected secret %s → env %s for container %s", env.ValueFrom.SecretRef, env.Name, svc.Name)
+				} else {
+					log.Printf("Warning: failed to resolve secret %s for %s: %v", env.ValueFrom.SecretRef, svc.Name, err)
 				}
-				// If secret not found, fall through to configmap/value.
 			}
 
-			// ── ConfigMap reference (overrides value) ─────────────
 			if !resolved && env.ValueFrom.ConfigMapRef != "" && c.configMgr != nil {
 				key := env.ValueFrom.Key
 				if key == "" {
-					key = env.Name // default: key name == env var name
+					key = env.Name
 				}
 				val, err := c.configMgr.resolve(env.ValueFrom.ConfigMapRef, key)
 				if err == nil {
 					envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, val))
 					resolved = true
+					log.Printf("ConfigMap %s/%s → env %s=%s for container %s", env.ValueFrom.ConfigMapRef, key, env.Name, val, svc.Name)
+				} else {
+					log.Printf("ConfigMap %s/%s not resolved for %s: %v", env.ValueFrom.ConfigMapRef, key, svc.Name, err)
 				}
-				// If configmap key not found, fall through to plain value.
 			}
 		}
 
-		// ── Plain value (built-in default, used as fallback) ────────
 		if !resolved && env.Value != "" {
 			envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, env.Value))
 		}
@@ -236,15 +271,14 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 		specOpts = append(specOpts, oci.WithEnv(envVars))
 	}
 
-	// 2. Add Volume Mounts
+	// ── 2. Add Volume Mounts ───────────────────────────────────────
 	for _, vol := range svc.Volumes {
-		// ── ConfigMap volume — mount keys as individual files ────
 		if vol.Type == "configmap" && vol.ConfigMap != nil && c.configMgr != nil {
 			mountDir, cleanup, err := c.prepareConfigMapMount(vol)
 			if err != nil {
 				return "", fmt.Errorf("failed to prepare configmap volume for %s: %w", svc.Name, err)
 			}
-			_ = cleanup // cleaned up when container is deleted
+			_ = cleanup
 
 			specOpts = append(specOpts, oci.WithMounts([]specs.Mount{
 				{
@@ -257,7 +291,6 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 			continue
 		}
 
-		// ── Regular bind/volume/tmpfs mount ──────────────────────
 		specOpts = append(specOpts, oci.WithMounts([]specs.Mount{
 			{
 				Type:        vol.Type,
@@ -268,12 +301,12 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 		}))
 	}
 
-	// 3. Set User (UID/GID)
+	// ── 3. Set User ────────────────────────────────────────────────
 	if svc.User != "" {
 		specOpts = append(specOpts, oci.WithUser(svc.User))
 	}
 
-	// 4. Inject Secrets as read-only bind mounts
+	// ── 4. Inject Secrets ──────────────────────────────────────────
 	if c.secrets != nil && len(svc.Secrets) > 0 {
 		secretRefs := make([]secrets.SecretRef, len(svc.Secrets))
 		for i, s := range svc.Secrets {
@@ -283,8 +316,6 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 		if err != nil {
 			return "", fmt.Errorf("failed to prepare secrets for %s: %w", svc.Name, err)
 		}
-		// Note: cleanup is deferred until after container creation.
-		// In production we'd track and clean up when the container is deleted.
 		_ = cleanup
 
 		specOpts = append(specOpts, oci.WithMounts([]specs.Mount{
@@ -298,17 +329,15 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 		log.Printf("Injected %d secret(s) for container %s", len(svc.Secrets), svc.Name)
 	}
 
-	// 5. Inject GPU resources (NVIDIA)
+	// ── 5. Inject GPU resources ────────────────────────────────────
 	if c.hwDetect != nil && svc.Resources != nil && svc.Resources.GPU != nil {
 		gpu := svc.Resources.GPU
 		if gpu.Type == "nvidia" || gpu.Type == "" {
-			// Add NVIDIA environment variables
 			nvidiaEnv := c.hwDetect.NVIDIARequiredEnv()
 			if len(nvidiaEnv) > 0 {
 				specOpts = append(specOpts, oci.WithEnv(nvidiaEnv))
 			}
 
-			// Add NVIDIA device mounts
 			nvidiaDevices := c.hwDetect.NVIDIARequiredDevices()
 			var deviceMounts []specs.Mount
 			for _, dev := range nvidiaDevices {
@@ -324,17 +353,72 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 		}
 	}
 
-	// 6. Network profile: join VPN gateway's network namespace if needed.
-	if c.netMgr != nil && svc.Network != "" {
-		netNormal := strings.ToLower(svc.Network)
-		if netNormal == "vpn" {
-			gwPID, ok := c.netMgr.GatewayPID()
-			if ok {
-				netNsPath := network.NetworkNamespacePath(gwPID)
-				specOpts = append(specOpts, withNetworkNamespace(netNsPath))
-				log.Printf("Container %s joining VPN network namespace (pid=%d)", svc.Name, gwPID)
+	// ── 6. Network: set up non-host networking via NetManager ──────
+	//    The NetManager handles bridge, IPAM, DNS, port forwarding, and
+	//    VPN policy routing.  The CRI client only wires in the namespace
+	//    and bind-mounts the DNS resolver.
+	var preparedNs string
+	var gatewayIP string // stored as label for staleness detection
+	if !useHostNet && c.netMgr != nil {
+		// Resolve VPN gateway (if any) for policy routing.
+		vpnGateway := resolveVPNGateway(c.netMgr, netProfile, svc.DependsOn)
+		netInfo, err := c.netMgr.Attach(svc.Name, netProfile, vpnGateway)
+		if err != nil {
+			return "", fmt.Errorf("network attach for %s: %w", svc.Name, err)
+		}
+		preparedNs = netInfo.NSPath
+
+		// Record the gateway's IP so the reconciler can detect staleness
+		// if the gateway restarts and gets a new IP.
+		if vpnGateway != "" {
+			if gwIP := c.netMgr.LookupIP(vpnGateway); gwIP != nil {
+				gatewayIP = gwIP.String()
 			}
 		}
+
+		// Bind-mount the single shared resolv.conf so the container has
+		// working DNS via the bridge gateway's in-process forwarder.
+		if preparedNs != "" {
+			resolvPath := "/var/lib/quartermaster/resolv.conf"
+			specOpts = append(specOpts, oci.WithMounts([]specs.Mount{
+				{
+					Type:        "bind",
+					Source:      resolvPath,
+					Destination: "/etc/resolv.conf",
+					Options:     []string{"bind", "ro"},
+				},
+			}))
+
+			// Mount generated hosts file for inter-container name resolution.
+			hostsPath := "/var/lib/quartermaster/caddy/hosts"
+			if _, err := os.Stat(hostsPath); err == nil {
+				specOpts = append(specOpts, oci.WithMounts([]specs.Mount{
+					{
+						Type:        "bind",
+						Source:      hostsPath,
+						Destination: "/etc/hosts",
+						Options:     []string{"bind", "ro"},
+					},
+				}))
+			}
+		}
+
+		// Port forwarding via DNAT.
+		if len(svc.Ports) > 0 && netInfo.IP != nil {
+			c.netMgr.ExposePorts(svc.Name, netInfo.IP, svc.Ports)
+		}
+	}
+
+	if preparedNs != "" {
+		specOpts = append(specOpts, withNetworkNamespace(preparedNs))
+	}
+
+	labels := map[string]string{
+		"quartermaster.name":        svc.Name,
+		"quartermaster.config-hash": svc.ConfigHash,
+	}
+	if gatewayIP != "" {
+		labels["quartermaster.gateway-ip"] = gatewayIP
 	}
 
 	container, err := c.client.NewContainer(
@@ -342,10 +426,7 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 		svc.Name,
 		containerd.WithNewSnapshot(svc.Name+"-snapshot", image),
 		containerd.WithNewSpec(specOpts...),
-		containerd.WithContainerLabels(map[string]string{
-			"quartermaster.name":        svc.Name,
-			"quartermaster.config-hash": svc.ConfigHash,
-		}),
+		containerd.WithContainerLabels(labels),
 	)
 	if err != nil {
 		return "", fmt.Errorf("failed to create container %s: %w", svc.Name, err)
@@ -354,8 +435,25 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 	return container.ID(), nil
 }
 
-// StartContainer starts a task for the container.  Container stdout/stderr are
-// captured into an in-memory ring buffer so they can be served via ContainerLogs.
+// resolveVPNGateway determines the VPN gateway name for a service that
+// should route egress through a VPN.  Uses the NetManager's IP tracking
+// to check if the dependency is already running.
+func resolveVPNGateway(nm network.NetManager, netProfile string, dependsOn []string) string {
+	if netProfile != "vpn" {
+		return ""
+	}
+
+	for _, dep := range dependsOn {
+		if ip := nm.LookupIP(dep); ip != nil {
+			log.Printf("VPN gateway %s found at %s", dep, ip)
+			return dep
+		}
+	}
+	log.Printf("VPN gateway not found among deps %v (LookupIP returned nil)", dependsOn)
+	return ""
+}
+
+// StartContainer starts a task for the container.
 func (c *ContainerdClient) StartContainer(ctx context.Context, containerID string) error {
 	ctx = c.withNamespace(ctx)
 	log.Printf("Starting container: %s", containerID)
@@ -366,14 +464,12 @@ func (c *ContainerdClient) StartContainer(ctx context.Context, containerID strin
 	}
 
 	rb := c.logs.get(containerID)
-	// Writer that sends to the ring buffer AND /dev/null so the
-	// container's stdout/stderr don't fill the daemon's own stdio.
 	logWriter := io.MultiWriter(rb, io.Discard)
 
 	task, err := container.NewTask(ctx, cio.NewCreator(cio.WithStreams(
-		nil,        // stdin  — not used
-		logWriter,  // stdout — captured
-		logWriter,  // stderr — captured
+		nil,
+		logWriter,
+		logWriter,
 	)))
 	if err != nil {
 		return fmt.Errorf("failed to create task for container %s: %w", containerID, err)
@@ -397,19 +493,14 @@ func (c *ContainerdClient) GetContainerPID(ctx context.Context, containerID stri
 
 	task, err := container.Task(ctx, nil)
 	if err != nil {
-		return 0, nil // Task not running, return 0
+		return 0, nil
 	}
 
 	return task.Pid(), nil
 }
 
 // ContainerLogs returns the trailing logs for a running container.
-//
-// First tries the in-memory ring buffer (populated for containers started
-// by this daemon process).  If the buffer is empty, falls back to reading
-// from containerd's shim stdout FIFO.
 func (c *ContainerdClient) ContainerLogs(ctx context.Context, containerID string, tail string) (string, error) {
-	// Verify the container exists and is running.
 	nscCtx := c.withNamespace(ctx)
 	container, err := c.client.LoadContainer(nscCtx, containerID)
 	if err != nil {
@@ -422,13 +513,11 @@ func (c *ContainerdClient) ContainerLogs(ctx context.Context, containerID string
 	}
 	_ = task
 
-	// Parse tail as approximate byte count.
 	var n int
 	if _, scanErr := fmt.Sscanf(tail, "%d", &n); scanErr != nil || n <= 0 {
-		n = 4096 // default to last 4KB
+		n = 4096
 	}
 
-	// Try the in-memory ring buffer first.
 	rb := c.logs.get(containerID)
 	if buf := rb.String(); len(buf) > 0 {
 		if tail == "all" || tail == "" {
@@ -437,14 +526,10 @@ func (c *ContainerdClient) ContainerLogs(ctx context.Context, containerID string
 		return rb.TailBytes(n), nil
 	}
 
-	// No logs captured yet — the container was started before this
-	// daemon's log capture was enabled.  Logs will appear after the
-	// next container restart.
 	return "(container was started before log capture was enabled — logs will appear after next restart)", nil
 }
 
 // StopContainer stops the running task for the container.
-// It first sends a SIGTERM and waits, then sends a SIGKILL if it's still running.
 func (c *ContainerdClient) StopContainer(ctx context.Context, containerID string) error {
 	ctx = c.withNamespace(ctx)
 	log.Printf("Stopping container: %s", containerID)
@@ -456,33 +541,27 @@ func (c *ContainerdClient) StopContainer(ctx context.Context, containerID string
 
 	task, err := container.Task(ctx, nil)
 	if err != nil {
-		// If there is no task, it might already be stopped.
 		return nil
 	}
 
-	// 1. Try SIGTERM
 	if err := task.Kill(ctx, 15); err != nil {
 		log.Printf("Warning: SIGTERM failed for %s: %v", containerID, err)
 	}
 
-	// 2. Wait for a grace period (e.g., 5 seconds)
 	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	exitStatusC, err := task.Wait(waitCtx)
 	if err != nil {
-		// If the context timed out, it means the container is still running
 		if waitCtx.Err() == context.DeadlineExceeded {
 			log.Printf("Container %s did not stop after SIGTERM, sending SIGKILL...", containerID)
 			if err := task.Kill(ctx, 9); err != nil {
 				return fmt.Errorf("failed to kill task %s with SIGKILL: %w", containerID, err)
 			}
-			
-			// Now wait for the actual exit after SIGKILL
-			// We use a new context for the wait to avoid being immediately canceled by the waitCtx
+
 			killWaitCtx, killCancel := context.WithTimeout(ctx, 5*time.Second)
 			defer killCancel()
-			
+
 			exitStatusC, err = task.Wait(killWaitCtx)
 			if err != nil {
 				return fmt.Errorf("failed to wait for task %s after SIGKILL: %w", containerID, err)
@@ -492,19 +571,15 @@ func (c *ContainerdClient) StopContainer(ctx context.Context, containerID string
 			return fmt.Errorf("failed to wait for task %s: %w", containerID, err)
 		}
 	} else {
-		// Container exited normally
 		<-exitStatusC
 	}
 
-	// Give the runtime a moment to update the task state
 	time.Sleep(1 * time.Second)
 
-	// Try deleting the task, with a retry loop in case the runtime is slow to update state
 	var lastErr error
 	for i := 0; i < 10; i++ {
 		if _, err := task.Delete(ctx); err != nil {
 			lastErr = err
-			// If it's still reported as running, try sending another SIGKILL to force the state change
 			if strings.Contains(err.Error(), "running") {
 				log.Printf("Warning: task %s still reported as running, sending extra SIGKILL...", containerID)
 				_ = task.Kill(ctx, 9)
@@ -561,22 +636,32 @@ func (c *ContainerdClient) ListContainers(ctx context.Context) ([]ContainerInfo,
 		if err != nil {
 			continue
 		}
-		
+
 		image, err := container.Image(ctx)
 		imageName := ""
 		if err == nil {
 			imageName = image.Name()
 		}
 
+		// Check if the task is actually running.
+		running := false
+		var pid uint32
+		if task, err := container.Task(ctx, nil); err == nil {
+			pid = task.Pid()
+			running = pid > 0
+		}
+
 		infos = append(infos, ContainerInfo{
-			ID:    container.ID(),
-			Name:  info.Labels["quartermaster.name"],
-			Image: imageName,
+			ID:         container.ID(),
+			Name:       info.Labels["quartermaster.name"],
+			Image:      imageName,
 			ConfigHash: info.Labels["quartermaster.config-hash"],
+			Running:    running,
+			PID:        pid,
+			GatewayIP:  info.Labels["quartermaster.gateway-ip"],
 		})
 	}
 
-	// Fallback: if name is empty, use ID
 	for i := range infos {
 		if infos[i].Name == "" {
 			infos[i].Name = infos[i].ID
@@ -587,7 +672,7 @@ func (c *ContainerdClient) ListContainers(ctx context.Context) ([]ContainerInfo,
 }
 
 // prepareConfigMapMount creates a temporary directory containing all keys
-// from a ConfigMap as individual files, ready for bind-mounting.
+// from a ConfigMap as individual files.
 func (c *ContainerdClient) prepareConfigMapMount(vol types.Volume) (string, func(), error) {
 	if c.configMgr == nil {
 		return "", nil, fmt.Errorf("config manager not configured")
@@ -616,8 +701,8 @@ func (c *ContainerdClient) prepareConfigMapMount(vol types.Volume) (string, func
 	return dir, cleanup, nil
 }
 
-// withNetworkNamespace is an OCI spec option that configures a container
-// to share another container's network namespace (sidecar pattern).
+// withNetworkNamespace is an OCI spec option that points the container's
+// network namespace at a pre-created named netns (via /var/run/netns/...).
 func withNetworkNamespace(path string) oci.SpecOpts {
 	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
 		for i := range s.Linux.Namespaces {
@@ -626,7 +711,6 @@ func withNetworkNamespace(path string) oci.SpecOpts {
 				return nil
 			}
 		}
-		// Network namespace not found in spec (shouldn't happen), add it
 		s.Linux.Namespaces = append(s.Linux.Namespaces, specs.LinuxNamespace{
 			Type: specs.NetworkNamespace,
 			Path: path,

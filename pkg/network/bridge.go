@@ -39,6 +39,7 @@ type BridgeManager struct {
 	nextIP byte
 	ipt4   *iptables.IPTables
 	brLink netlink.Link
+	dns    *DNSForwarder
 
 	// ips tracks service-name → bridge IP for LookupIP and DNAT cleanup.
 	ips map[string]net.IP
@@ -107,9 +108,15 @@ func (b *BridgeManager) Setup() error {
 		}
 	}
 
+	// ── 6. Start DNS forwarder on the bridge gateway ─────────────
+	b.dns = NewDNSForwarder(b.ips)
+	if err := b.dns.Start(); err != nil {
+		return fmt.Errorf("start DNS forwarder: %w", err)
+	}
+
 	b.setup = true
 	b.brLink = br
-	log.Printf("Bridge %s ready (subnet %s, gw %s)", bridgeName, bridgeSubnet, bridgeGW)
+	log.Printf("Bridge %s ready (subnet %s, gw %s, DNS on :53)", bridgeName, bridgeSubnet, bridgeGW)
 	return nil
 }
 
@@ -119,6 +126,12 @@ func (b *BridgeManager) Teardown() error {
 	defer b.mu.Unlock()
 	if !b.setup {
 		return nil
+	}
+
+	// ── Stop DNS forwarder ──────────────────────────────────────
+	if b.dns != nil {
+		b.dns.Stop()
+		b.dns = nil
 	}
 
 	if b.ipt4 != nil {
@@ -277,24 +290,7 @@ func (b *BridgeManager) Attach(serviceName string, profile string, vpnGateway st
 		return NetInfo{}, fmt.Errorf("configure netns %s: %w", nsName, err)
 	}
 
-	// ── 7. Resolv.conf ────────────────────────────────────────────
-	//    VPN-dependent containers use the gateway's internal DNS so all
-	//    DNS queries go through the VPN tunnel.  Other containers use
-	//    public DNS via the bridge gateway.
-	nsResolvDir := fmt.Sprintf("/etc/netns/%s", nsName)
-	os.MkdirAll(nsResolvDir, 0755)
-	if p == ProfileVPN && vpnGateway != "" {
-		gwIP := b.LookupIP(vpnGateway)
-		if gwIP != nil {
-			os.WriteFile(nsResolvDir+"/resolv.conf", []byte("nameserver "+gwIP.String()+"\n"), 0644)
-		} else {
-			os.WriteFile(nsResolvDir+"/resolv.conf", []byte("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"), 0644)
-		}
-	} else {
-		os.WriteFile(nsResolvDir+"/resolv.conf", []byte("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"), 0644)
-	}
-
-	// ── 8. VPN policy routing ─────────────────────────────────────
+	// ── 7. VPN policy routing ─────────────────────────────────────
 	if p == ProfileVPN && vpnGateway != "" {
 		gwIP := b.LookupIP(vpnGateway)
 		if gwIP != nil {
@@ -357,6 +353,31 @@ func (b *BridgeManager) LookupIP(serviceName string) net.IP {
 		return ip
 	}
 	return b.ips[ShortName(serviceName)]
+}
+
+// ── DNS delgation ──────────────────────────────────────────────────────
+
+// StartDNS implements NetManager.
+func (b *BridgeManager) StartDNS() error {
+	if b.dns == nil {
+		b.dns = NewDNSForwarder(b.ips)
+	}
+	return b.dns.Start()
+}
+
+// StopDNS implements NetManager.
+func (b *BridgeManager) StopDNS() error {
+	if b.dns == nil {
+		return nil
+	}
+	return b.dns.Stop()
+}
+
+// UpdateDNSGateway implements NetManager.
+func (b *BridgeManager) UpdateDNSGateway(gatewayName string, newIP net.IP) {
+	if b.dns != nil {
+		b.dns.UpdateGluetunIP(newIP)
+	}
 }
 
 // Recover reads the persisted IP map from disk, falling back to scanning

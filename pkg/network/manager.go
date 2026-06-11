@@ -2,19 +2,24 @@
 //
 // Three profiles are supported:
 //
-//	public   — standard bridge, host ports exposed (game servers, Jellyfin)
-//	internal — standard bridge, NO host ports (databases, internal services)
-//	vpn      — shares the network namespace of a VPN gateway container
+//	public   — host networking (container shares host netns)
+//	internal — own netns on the qm0 bridge, no host ports exposed
+//	vpn      — own netns on the qm0 bridge + CAP_NET_ADMIN; optionally routes
+//	           egress through a VPN gateway via policy routing
 //
-// VPN namespace sharing is determined by depends_on: a service with
-// network: vpn that depends_on another vpn service will join that
-// service's network namespace.  The root vpn service (no vpn dependency)
-// becomes the gateway automatically.
+// VPN routing uses Linux policy routing instead of PID-based namespace
+// sharing: each vpn-dependent service gets a second routing table that
+// sends all traffic through the VPN gateway's bridge IP.  This eliminates
+// PID tracking, /proc/<pid>/ns/net lookups, namespace sharing, firewall
+// flushing, and all the restart-recovery hacks that approach required.
 package network
 
 import (
 	"fmt"
+	"net"
 	"strings"
+
+	"quartermaster/pkg/types"
 )
 
 // Profile is a named network profile.
@@ -46,66 +51,115 @@ func NormaliseProfile(p string) Profile {
 	return Profile(strings.ToLower(p))
 }
 
-// Manager tracks network profiles and resolves VPN gateway PIDs.
-type Manager struct {
-	// gatewayPID is the PID of the VPN gateway container's task, or 0 if
-	// no gateway is registered yet.
-	gatewayPID uint32
+// ── NetInfo ─────────────────────────────────────────────────────────────
+
+// NetInfo is returned by Attach and describes the network configuration
+// the container runtime should apply.
+type NetInfo struct {
+	// NSPath is the path to a pre-created network namespace, or empty
+	// for host-networked containers.
+	NSPath string
+
+	// IP is the bridge IP assigned to this container, or nil for
+	// public (host-networked) containers.
+	IP net.IP
 }
 
-// NewManager creates a new network manager.
-func NewManager() *Manager {
-	return &Manager{}
+// ── TailscaleExposure ──────────────────────────────────────────────────
+
+// TailscaleExposure describes a service to expose via a tailscale container.
+type TailscaleExposure struct {
+	ServiceName string             // name of the target service
+	ServiceIP   net.IP             // bridge IP of the target service
+	Expose      types.ExposeConfig // the exposure configuration
+	Ports       []types.Port       // the service's declared ports
 }
 
-// RegisterVPNGateway records the PID of the VPN gateway container.
-// Called by the reconciler after creating the root vpn service.
-func (m *Manager) RegisterVPNGateway(pid uint32) {
-	m.gatewayPID = pid
+// ── NetManager interface ────────────────────────────────────────────────
+
+// NetManager handles all container networking: bridge setup, namespace
+// creation, IPAM, port forwarding, and VPN policy routing.
+type NetManager interface {
+	// Setup creates the bridge, enables forwarding, and configures NAT.
+	// Idempotent; safe to call multiple times.
+	Setup() error
+
+	// Attach creates a network namespace for the service and wires it
+	// to the bridge.  For host-networked services (public), returns an
+	// empty NetInfo and performs no setup.
+	//
+	// vpnGateway is the name of the VPN gateway service whose bridge IP
+	// this service should route egress through, or empty if this is the
+	// gateway itself or a non-VPN service.
+	Attach(serviceName string, profile string, vpnGateway string) (NetInfo, error)
+
+	// Detach removes the namespace, veth pair, DNAT rules, and any VPN
+	// policy routes associated with the service.
+	Detach(serviceName string, profile string) error
+
+	// ExposePorts adds iptables DNAT rules forwarding host ports to the
+	// container's bridge IP.  Rules are tracked for cleanup on Detach.
+	ExposePorts(containerName string, containerIP net.IP, ports []types.Port)
+
+	// ConfigureVPNGateway enters the VPN gateway's network namespace
+	// and configures it to forward traffic from the bridge subnet through
+	// the VPN tunnel.  Must be called after the gateway container has
+	// started (so its own tunnel interface and firewall are initialised).
+	ConfigureVPNGateway(serviceName string) error
+
+	// ConfigureTailscale configures a tailscale container to expose the
+	// given services.  For "tailscale" type it adds iptables DNAT rules.
+	// For "serve" and "funnel" types it additionally runs tailscale CLI
+	// commands via the provided exec function.
+	ConfigureTailscale(serviceName string, exposures []TailscaleExposure, execFn func(cmd ...string) error) error
+
+	// LookupIP returns the bridge IP for a running service, or nil if
+	// the service uses host networking or is not known.
+	LookupIP(serviceName string) net.IP
+
+	// Recover repopulates the IP map from persistent state after a daemon
+	// restart.  Must be called after Setup and before Attach/LookupIP.
+	Recover() error
+
+	// StartDNS starts the in-process DNS forwarder on the bridge gateway IP.
+	// Must be called after Setup() so the bridge IP is assigned.
+	StartDNS() error
+
+	// StopDNS stops the DNS forwarder.
+	StopDNS() error
+
+	// UpdateDNSGateway notifies the DNS forwarder that a gateway's bridge IP
+	// changed.  Used for live DNS updates when gluetun restarts.
+	UpdateDNSGateway(gatewayName string, newIP net.IP)
+
+	// Teardown removes the bridge and all iptables rules.
+	Teardown() error
 }
 
-// UnregisterVPNGateway clears the VPN gateway registration.
-func (m *Manager) UnregisterVPNGateway() {
-	m.gatewayPID = 0
-}
+// ── Profile resolution ──────────────────────────────────────────────────
 
-// GatewayPID returns the PID of the VPN gateway, and whether one is
-// registered.
-func (m *Manager) GatewayPID() (uint32, bool) {
-	return m.gatewayPID, m.gatewayPID != 0
-}
-
-// NetworkNamespacePath returns the /proc path to the network namespace
-// of a process, for use with OCI namespace sharing.
-func NetworkNamespacePath(pid uint32) string {
-	return fmt.Sprintf("/proc/%d/ns/net", pid)
-}
-
-// ResolveProfile determines what to do for a given profile and dependency
-// list.
+// ResolveProfile determines the network role for a service.
 //
-//	isGateway is true when this service should be registered as the VPN
-//	         gateway (first vpn service with no vpn dependency).
-//	sharePID  is the non-zero PID of the gateway whose namespace this
-//	         service should join.
-func (m *Manager) ResolveProfile(network string, dependsOn []string, runningServices map[string]uint32) (isGateway bool, sharePID uint32, err error) {
+//	isGateway is true when this service should act as the VPN gateway
+//	         (first vpn service with no running vpn dependency).
+//	gatewayName is the name of the VPN gateway this service should route
+//	            through, or empty if it IS the gateway or not a vpn service.
+func ResolveProfile(network string, dependsOn []string, runningBridgeIPs map[string]string) (isGateway bool, gatewayName string, err error) {
 	p := NormaliseProfile(network)
 
 	switch p {
 	case ProfilePublic, ProfileInternal:
-		return false, 0, nil
+		return false, "", nil
 
 	case ProfileVPN:
-		// Walk depends_on to find a vpn service that's already running.
 		for _, dep := range dependsOn {
-			if pid, ok := runningServices[dep]; ok && pid != 0 {
-				return false, pid, nil // dependent — share the dependency's namespace
+			if _, ok := runningBridgeIPs[dep]; ok {
+				return false, dep, nil
 			}
 		}
-		// No running vpn dependency — this service IS the gateway.
-		return true, 0, nil
+		return true, "", nil
 
 	default:
-		return false, 0, fmt.Errorf("unknown network profile: %q", network)
+		return false, "", fmt.Errorf("unknown network profile: %q", network)
 	}
 }
