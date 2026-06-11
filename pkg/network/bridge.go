@@ -674,7 +674,19 @@ func (b *BridgeManager) ExposePorts(containerName string, containerIP net.IP, po
 		if err := b.ipt4.Append("nat", "PREROUTING", args...); err != nil {
 			log.Printf("Warning: DNAT %s:%d → %s: %v", containerName, p.Host, to, err)
 		} else {
-			log.Printf("Exposed %s port %d/%s → %s", containerName, p.Host, proto, to)
+			log.Printf("Exposed %s port %d/%s → %s (PREROUTING)", containerName, p.Host, proto, to)
+		}
+
+		// Also add OUTPUT chain DNAT so host-local traffic works
+		// (e.g. curl localhost:8080) — rule #39.
+		argsOut := []string{"-p", proto, "--dport", dport, "-j", "DNAT", "--to-destination", to}
+		existsOut, _ := b.ipt4.Exists("nat", "OUTPUT", argsOut...)
+		if !existsOut {
+			if err := b.ipt4.Append("nat", "OUTPUT", argsOut...); err != nil {
+				log.Printf("Warning: DNAT OUTPUT %s:%d → %s: %v", containerName, p.Host, to, err)
+			} else {
+				log.Printf("Exposed %s port %d/%s → %s (OUTPUT)", containerName, p.Host, proto, to)
+			}
 		}
 	}
 }
@@ -897,6 +909,20 @@ func (b *BridgeManager) configureNamespace(nsName, ctrVeth, ip string) error {
 	}
 	if err := handle.LinkSetUp(ctrLink); err != nil {
 		return fmt.Errorf("bring %s up: %w", ctrVeth, err)
+	}
+
+	// ── Disable rp_filter on the container veth so return-path
+	//    traffic from VPN gateway works correctly (rule #5).
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	origNs, _ := netns.Get()
+	defer origNs.Close()
+	defer netns.Set(origNs)
+	if targetNs, err := netns.GetFromName(nsName); err == nil {
+		defer targetNs.Close()
+		netns.Set(targetNs)
+		rpPath := fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/rp_filter", ctrVeth)
+		os.WriteFile(rpPath, []byte("0"), 0644)
 	}
 
 	lo, _ := handle.LinkByName("lo")
