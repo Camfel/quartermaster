@@ -137,6 +137,12 @@ type NetManager interface {
 	// route in table 100 is updated; no container recreates are needed.
 	UpdateGatewayRoute(gatewayIP string) error
 
+	// RecoverVPNRouting re-applies fwmark-based VPN routing for all existing
+	// containers after a daemon restart.  Called during recovery to ensure
+	// the mangle mark rules and host-level fwmark infrastructure are present
+	// even for containers created before a Network v2 upgrade.
+	RecoverVPNRouting(vpnGateway string) error
+
 	// Teardown removes the bridge and all iptables rules.
 	Teardown() error
 }

@@ -11,8 +11,8 @@ Restart=always
 User=quartermaster
 Group=quartermaster
 # Linux capabilities required for container lifecycle management
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_DAC_OVERRIDE
-AmbientCapabilities=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_DAC_OVERRIDE
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_DAC_OVERRIDE CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_DAC_OVERRIDE CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target

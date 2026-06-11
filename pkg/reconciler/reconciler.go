@@ -89,6 +89,7 @@ func (r *Reconciler) ReconcileStack(ctx context.Context, stack *types.Stack) err
 
 	// 3. Reconcile: Add or Update (in dependency order).
 	ordered := topologicalSort(stack.Spec.Services)
+
 	for _, svc := range ordered {
 		actual, exists := actualMap[svc.Name]
 

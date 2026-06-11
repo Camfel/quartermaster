@@ -47,9 +47,15 @@ func NewDNSForwarder(ipMap map[string]net.IP) *DNSForwarder {
 
 // Start begins listening on the bridge gateway IP (UDP port 53).
 func (f *DNSForwarder) Start() error {
+	// Bind the UDP socket synchronously so permission errors are caught
+	// immediately rather than surfacing asynchronously in a goroutine.
+	pc, err := net.ListenPacket("udp", bridgeGW+":53")
+	if err != nil {
+		return fmt.Errorf("bind DNS on %s:53: %w", bridgeGW, err)
+	}
+
 	f.server = &dns.Server{
-		Addr: bridgeGW + ":53",
-		Net:  "udp",
+		PacketConn: pc,
 		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
 			f.handleDNS(w, r)
 		}),
@@ -57,7 +63,7 @@ func (f *DNSForwarder) Start() error {
 
 	log.Printf("DNS forwarder starting on %s:53", bridgeGW)
 	go func() {
-		if err := f.server.ListenAndServe(); err != nil {
+		if err := f.server.ActivateAndServe(); err != nil {
 			log.Printf("DNS forwarder stopped: %v", err)
 		}
 	}()

@@ -408,11 +408,94 @@ func (b *BridgeManager) Recover() error {
 		}
 		b.nextIP = maxByte + 1
 		log.Printf("Recovered %d bridge IP(s) from %s (next IP: .%d)", len(b.ips), ipsFile, b.nextIP)
+
+		// Re-apply fwmark VPN routing for existing containers after restart.
+		if _, ok := b.ips["gluetun"]; ok {
+			b.mu.Unlock()
+			if err := b.RecoverVPNRouting("gluetun"); err != nil {
+				log.Printf("Warning: recover VPN routing: %v", err)
+			}
+			b.mu.Lock()
+		}
+
 		return nil
 	}
 
 	// No persisted file — scan existing netns (upgrade path).
 	return b.scanNetns()
+}
+
+// RecoverVPNRouting re-applies the fwmark-based VPN routing for all
+// existing containers after a daemon restart.  This ensures the mangle
+// mark rules and host-level fwmark infrastructure are present even for
+// containers that were created before the Network v2 upgrade.
+func (b *BridgeManager) RecoverVPNRouting(vpnGateway string) error {
+	log.Printf("RecoverVPNRouting: starting for gateway %s", vpnGateway)
+	b.mu.Lock()
+	gwIP := b.ips[vpnGateway]
+	if gwIP == nil {
+		gwIP = b.ips[ShortName(vpnGateway)]
+	}
+	b.mu.Unlock()
+
+	if gwIP == nil {
+		return fmt.Errorf("VPN gateway %s not found in IP map", vpnGateway)
+	}
+
+	// Ensure host-level fwmark routing infrastructure.
+	if err := b.ensureFwmarkRouting(gwIP.String()); err != nil {
+		return fmt.Errorf("ensure fwmark routing: %w", err)
+	}
+
+	// Re-apply mangle mark rule in every VPN container's namespace.
+	b.mu.Lock()
+	names := make([]string, 0, len(b.ips))
+	for name := range b.ips {
+		names = append(names, name)
+	}
+	b.mu.Unlock()
+
+	for _, name := range names {
+		nsName := "qm-" + ShortName(name)
+		nsHandle, err := netns.GetFromName(nsName)
+		if err != nil {
+			continue
+		}
+		nsHandle.Close()
+
+		runtime.LockOSThread()
+		origNs, _ := netns.Get()
+		targetNs, err := netns.GetFromName(nsName)
+		if err != nil {
+			runtime.UnlockOSThread()
+			continue
+		}
+		netns.Set(targetNs)
+
+		ipt, err := iptables.New()
+		if err != nil {
+			netns.Set(origNs)
+			origNs.Close()
+			targetNs.Close()
+			runtime.UnlockOSThread()
+			continue
+		}
+
+		mangleArgs := []string{"!", "-d", bridgeSubnet, "-j", "MARK", "--set-mark", "100"}
+		if exists, _ := ipt.Exists("mangle", "OUTPUT", mangleArgs...); !exists {
+			if err := ipt.Insert("mangle", "OUTPUT", 1, mangleArgs...); err != nil {
+				log.Printf("Warning: mangle insert for %s: %v", name, err)
+			} else {
+				log.Printf("Recovered VPN mangle rule for %s", name)
+			}
+		}
+		netns.Set(origNs)
+		origNs.Close()
+		targetNs.Close()
+		runtime.UnlockOSThread()
+	}
+
+	return nil
 }
 
 // scanNetns reads bridge IPs from existing named network namespaces.
@@ -782,9 +865,9 @@ func (b *BridgeManager) setupVPNRouting(nsName, containerIP, gatewayIP, ctrVeth 
 	}
 
 	// iptables runs inside the container's namespace.
-	// Rule: mark all non-bridge, non-LAN traffic with fwmark 100.
-	// Bridge-local (10.42.0.0/24) and LAN (192.168.0.0/24) stay unmarked.
-	mangleArgs := []string{"-d", "!", bridgeSubnet, "-d", "!", "192.168.0.0/24", "-j", "MARK", "--set-mark", "100"}
+	// Rule: mark all non-bridge traffic with fwmark 100.
+	// Bridge-local (10.42.0.0/24) stays unmarked, routed through main table.
+	mangleArgs := []string{"!", "-d", bridgeSubnet, "-j", "MARK", "--set-mark", "100"}
 	if exists, _ := b.ipt4.Exists("mangle", "OUTPUT", mangleArgs...); !exists {
 		if err := b.ipt4.Insert("mangle", "OUTPUT", 1, mangleArgs...); err != nil {
 			return fmt.Errorf("add mangle mark rule in %s: %w", nsName, err)
@@ -817,7 +900,7 @@ func (b *BridgeManager) teardownVPNRouting(nsName, containerIP string) {
 	defer netns.Set(origNs)
 
 	netns.Set(nsHandle)
-	mangleArgs := []string{"-d", "!", bridgeSubnet, "-d", "!", "192.168.0.0/24", "-j", "MARK", "--set-mark", "100"}
+	mangleArgs := []string{"!", "-d", bridgeSubnet, "-j", "MARK", "--set-mark", "100"}
 	b.ipt4.Delete("mangle", "OUTPUT", mangleArgs...)
 	log.Printf("Removed VPN mangle rule for %s", containerIP)
 }
