@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -741,81 +742,122 @@ func ruleToDeleteArgs(rule, ipStr string) []string {
 
 // ── VPN policy routing ──────────────────────────────────────────────────
 
-// setupVPNRouting configures policy routing inside the container's namespace
-// so egress traffic goes through the VPN gateway while bridge traffic stays
-// direct.  Uses NewHandleAt to prevent namespace leakage.
+// setupVPNRouting adds a connection-mark mangle rule inside the container's
+// namespace so non-bridge, non-LAN egress is marked with fwmark 100.  The
+// host's shared fwmark-based routing table 100 directs marked packets through
+// the VPN gateway.  This replaces per-container ip rules with one shared
+// routing table for the whole VPN zone.
 func (b *BridgeManager) setupVPNRouting(nsName, containerIP, gatewayIP, ctrVeth string) error {
+	// ── 1. Add mangle mark rule inside the container's netns ─────
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	origNs, err := netns.Get()
+	if err != nil {
+		return fmt.Errorf("get host netns: %w", err)
+	}
+	defer origNs.Close()
+	defer netns.Set(origNs)
+
+	targetNs, err := netns.GetFromName(nsName)
+	if err != nil {
+		return fmt.Errorf("open netns %s: %w", nsName, err)
+	}
+	defer targetNs.Close()
+
+	if err := netns.Set(targetNs); err != nil {
+		return fmt.Errorf("enter netns %s: %w", nsName, err)
+	}
+
+	// iptables runs inside the container's namespace.
+	// Rule: mark all non-bridge, non-LAN traffic with fwmark 100.
+	// Bridge-local (10.42.0.0/24) and LAN (192.168.0.0/24) stay unmarked.
+	mangleArgs := []string{"-d", "!", bridgeSubnet, "-d", "!", "192.168.0.0/24", "-j", "MARK", "--set-mark", "100"}
+	if exists, _ := b.ipt4.Exists("mangle", "OUTPUT", mangleArgs...); !exists {
+		if err := b.ipt4.Insert("mangle", "OUTPUT", 1, mangleArgs...); err != nil {
+			return fmt.Errorf("add mangle mark rule in %s: %w", nsName, err)
+		}
+		log.Printf("VPN mangle mark: %s → fwmark 100 (bridge/LAN direct)", containerIP)
+	}
+
+	// ── 2. Ensure host-level fwmark routing infrastructure ───────
+	if err := b.ensureFwmarkRouting(gatewayIP); err != nil {
+		return fmt.Errorf("host fwmark routing: %w", err)
+	}
+
+	log.Printf("VPN routing: %s → fwmark 100 → table %d via %s", containerIP, vpnRouteTable, gatewayIP)
+	return nil
+}
+
+// teardownVPNRouting removes the iptables mangle mark rule from the
+// container's namespace.
+func (b *BridgeManager) teardownVPNRouting(nsName, containerIP string) {
+	nsHandle, err := netns.GetFromName(nsName)
+	if err != nil {
+		return
+	}
+	defer nsHandle.Close()
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	origNs, _ := netns.Get()
+	defer origNs.Close()
+	defer netns.Set(origNs)
+
+	netns.Set(nsHandle)
+	mangleArgs := []string{"-d", "!", bridgeSubnet, "-d", "!", "192.168.0.0/24", "-j", "MARK", "--set-mark", "100"}
+	b.ipt4.Delete("mangle", "OUTPUT", mangleArgs...)
+	log.Printf("Removed VPN mangle rule for %s", containerIP)
+}
+
+// ── Fwmark routing infrastructure (host-level) ─────────────────────────
+
+// ensureFwmarkRouting sets up the shared fwmark-based routing on the host.
+// A single ip rule (fwmark 100 → table 100) and a single default route
+// via the VPN gateway replace the old per-container policy rules.
+// Idempotent; safe to call multiple times.
+func (b *BridgeManager) ensureFwmarkRouting(gatewayIP string) error {
+	rule := netlink.NewRule()
+	rule.Mark = 100
+	rule.Table = vpnRouteTable
+	if err := netlink.RuleAdd(rule); err != nil && !os.IsExist(err) {
+		return fmt.Errorf("add fwmark 100 rule: %w", err)
+	}
+
 	gw := net.ParseIP(gatewayIP)
 	if gw == nil {
 		return fmt.Errorf("invalid gateway IP %q", gatewayIP)
 	}
-
-	handle, err := getHandle(nsName)
-	if err != nil {
-		return fmt.Errorf("open netns %s for VPN routing: %w", nsName, err)
-	}
-	defer handle.Delete()
-
-	vethLink, err := handle.LinkByName(ctrVeth)
-	if err != nil {
-		return fmt.Errorf("find veth %s: %w", ctrVeth, err)
-	}
-
-	// Route 1: bridge subnet stays local (direct L2, no gateway hop).
-	_, bridgeNet, _ := net.ParseCIDR(bridgeSubnet)
-	bridgeRoute := &netlink.Route{
-		Dst:       bridgeNet,
-		LinkIndex: vethLink.Attrs().Index,
-		Table:     vpnRouteTable,
-		Scope:     netlink.SCOPE_LINK,
-	}
-	if err := handle.RouteAdd(bridgeRoute); err != nil && !os.IsExist(err) {
-		return fmt.Errorf("add bridge-subnet route: %w", err)
-	}
-
-	// Route 2: default via VPN gateway for internet egress.
-	defaultRoute := &netlink.Route{
+	route := &netlink.Route{
 		Dst:   &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)},
 		Gw:    gw,
 		Table: vpnRouteTable,
 	}
-	if err := handle.RouteAdd(defaultRoute); err != nil && !os.IsExist(err) {
-		return fmt.Errorf("add default route via %s: %w", gatewayIP, err)
+	if err := netlink.RouteReplace(route); err != nil {
+		return fmt.Errorf("add fwmark default route via %s: %w", gatewayIP, err)
 	}
-
-	// Policy rule: traffic FROM this container's IP uses table 100.
-	src, _ := netlink.ParseIPNet(containerIP + "/32")
-	rule := netlink.NewRule()
-	rule.Table = vpnRouteTable
-	rule.Src = src
-	if err := handle.RuleAdd(rule); err != nil && !os.IsExist(err) {
-		return fmt.Errorf("add ip rule from %s: %w", containerIP, err)
-	}
-
-	log.Printf("VPN routing: %s → table %d (bridge direct, default via %s)", containerIP, vpnRouteTable, gatewayIP)
+	log.Printf("Fwmark routing: table %d default via %s", vpnRouteTable, gatewayIP)
 	return nil
 }
 
-// teardownVPNRouting removes the policy routing rule from the container's
-// namespace.  Uses NewHandleAt to prevent namespace leakage.
-func (b *BridgeManager) teardownVPNRouting(nsName, containerIP string) {
-	handle, err := getHandle(nsName)
-	if err != nil {
-		return // namespace already gone
+// UpdateGatewayRoute implements NetManager.  Replaces the default route in
+// table 100 when the VPN gateway's bridge IP changes.  No container
+// recreates needed.
+func (b *BridgeManager) UpdateGatewayRoute(gatewayIP string) error {
+	gw := net.ParseIP(gatewayIP)
+	if gw == nil {
+		return fmt.Errorf("invalid gateway IP %q", gatewayIP)
 	}
-	defer handle.Delete()
-
-	src, err := netlink.ParseIPNet(containerIP + "/32")
-	if err != nil {
-		return
+	route := &netlink.Route{
+		Dst:   &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)},
+		Gw:    gw,
+		Table: vpnRouteTable,
 	}
-	rule := netlink.NewRule()
-	rule.Table = vpnRouteTable
-	rule.Src = src
-	if err := handle.RuleDel(rule); err != nil {
-		return // already gone
+	if err := netlink.RouteReplace(route); err != nil {
+		return fmt.Errorf("replace fwmark route via %s: %w", gatewayIP, err)
 	}
-	log.Printf("Removed VPN routing rule for %s", containerIP)
+	log.Printf("Updated fwmark route: table %d default via %s", vpnRouteTable, gatewayIP)
+	return nil
 }
 
 // ── Namespace-scoped netlink helpers ────────────────────────────────────

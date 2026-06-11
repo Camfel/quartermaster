@@ -132,6 +132,11 @@ type NetManager interface {
 	// changed.  Used for live DNS updates when gluetun restarts.
 	UpdateDNSGateway(gatewayName string, newIP net.IP)
 
+	// UpdateGatewayRoute replaces the fwmark routing table's default route
+	// when the VPN gateway's bridge IP changes.  Only the single shared
+	// route in table 100 is updated; no container recreates are needed.
+	UpdateGatewayRoute(gatewayIP string) error
+
 	// Teardown removes the bridge and all iptables rules.
 	Teardown() error
 }
