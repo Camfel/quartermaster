@@ -274,6 +274,7 @@ func serviceConfigHash(svc *types.Service) string {
 		GPU     string
 		Expose  *types.ExposeConfig
 		Ingress *types.IngressConfig
+		Log     *types.LogConfig
 	}{
 		Image:   svc.Image,
 		Env:     svc.Env,
@@ -283,6 +284,7 @@ func serviceConfigHash(svc *types.Service) string {
 		Network: svc.Network,
 		Expose:  svc.Expose,
 		Ingress: svc.Ingress,
+		Log:     svc.Log,
 	}
 	if svc.Resources != nil && svc.Resources.GPU != nil {
 		payload.GPU = svc.Resources.GPU.Type + ":" + svc.Resources.GPU.ID

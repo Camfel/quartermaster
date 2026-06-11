@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -94,6 +95,76 @@ func (ls *logStore) remove(containerID string) {
 	delete(ls.bufs, containerID)
 }
 
+// ── Persistent log file with rotation ──────────────────────────────────
+
+// rotatingFile writes to a log file, rotating when it exceeds maxBytes.
+// Safe for concurrent use by a single writer (container stdout/stderr).
+type rotatingFile struct {
+	dir      string
+	maxBytes int64
+	maxFiles int
+	mu       sync.Mutex
+	file     *os.File
+	written  int64
+}
+
+func newRotatingFile(dir string, maxBytes int64, maxFiles int) (*rotatingFile, error) {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, err
+	}
+	rf := &rotatingFile{dir: dir, maxBytes: maxBytes, maxFiles: maxFiles}
+	if err := rf.open(); err != nil {
+		return nil, err
+	}
+	return rf, nil
+}
+
+func (rf *rotatingFile) open() error {
+	path := filepath.Join(rf.dir, "current.log")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	fi, _ := f.Stat()
+	rf.file = f
+	rf.written = fi.Size()
+	return nil
+}
+
+func (rf *rotatingFile) Write(p []byte) (int, error) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.written+int64(len(p)) > rf.maxBytes && rf.maxBytes > 0 {
+		rf.rotate()
+	}
+	n, err := rf.file.Write(p)
+	rf.written += int64(n)
+	return n, err
+}
+
+func (rf *rotatingFile) rotate() {
+	rf.file.Close()
+	for i := rf.maxFiles - 1; i >= 1; i-- {
+		old := filepath.Join(rf.dir, fmt.Sprintf("current.%d.log", i))
+		new := filepath.Join(rf.dir, fmt.Sprintf("current.%d.log", i+1))
+		os.Rename(old, new)
+	}
+	current := filepath.Join(rf.dir, "current.log")
+	first := filepath.Join(rf.dir, "current.1.log")
+	os.Rename(current, first)
+	rf.open()
+}
+
+func (rf *rotatingFile) Close() error {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.file != nil {
+		return rf.file.Close()
+	}
+	return nil
+}
+
 // ContainerdClient is the real implementation of ContainerClient using containerd.
 type ContainerdClient struct {
 	client    *containerd.Client
@@ -103,6 +174,7 @@ type ContainerdClient struct {
 	netMgr    network.NetManager   // network: bridge, IPAM, port forwarding, VPN routing
 	configMgr *configManagerLookup // optional: for ConfigMap resolution
 	logs      *logStore
+	logCfgs   map[string]*types.LogConfig // containerID → persistent log config
 }
 
 // configManagerLookup is a subset of ConfigManager used for runtime resolution.
@@ -131,6 +203,7 @@ func NewContainerdClient(socketPath, namespace string) (*ContainerdClient, error
 		client:    client,
 		namespace: namespace,
 		logs:      newLogStore(),
+		logCfgs:   make(map[string]*types.LogConfig),
 	}, nil
 }
 
@@ -432,6 +505,11 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 		return "", fmt.Errorf("failed to create container %s: %w", svc.Name, err)
 	}
 
+	// Store log config for use by StartContainer.
+	if svc.Log != nil && svc.Log.Enabled {
+		c.logCfgs[container.ID()] = svc.Log
+	}
+
 	return container.ID(), nil
 }
 
@@ -464,7 +542,32 @@ func (c *ContainerdClient) StartContainer(ctx context.Context, containerID strin
 	}
 
 	rb := c.logs.get(containerID)
-	logWriter := io.MultiWriter(rb, io.Discard)
+	var logWriter io.Writer = rb
+
+	// If persistent logging is enabled for this container, tee output to
+	// a rotating log file on disk at /var/lib/quartermaster/logs/<name>/.
+	if lc, ok := c.logCfgs[containerID]; ok && lc.Enabled {
+		maxBytes := int64(50 * 1024 * 1024) // default 50MB
+		if lc.MaxSize != "" {
+			if parsed, err := parseSize(lc.MaxSize); err == nil {
+				maxBytes = parsed
+			} else {
+				log.Printf("Warning: invalid log max_size %q for %s, using 50MB", lc.MaxSize, containerID)
+			}
+		}
+		maxFiles := lc.MaxFiles
+		if maxFiles <= 0 {
+			maxFiles = 5
+		}
+		dir := filepath.Join("/var/lib/quartermaster/logs", containerID)
+		if rf, err := newRotatingFile(dir, maxBytes, maxFiles); err == nil {
+			logWriter = io.MultiWriter(rb, rf)
+			log.Printf("Persistent logging enabled for %s → %s", containerID, dir)
+		} else {
+			log.Printf("Warning: failed to create rotating log for %s: %v", containerID, err)
+			logWriter = rb
+		}
+	}
 
 	task, err := container.NewTask(ctx, cio.NewCreator(cio.WithStreams(
 		nil,
@@ -717,4 +820,31 @@ func withNetworkNamespace(path string) oci.SpecOpts {
 		})
 		return nil
 	}
+}
+
+// parseSize converts a human-readable size string like "10MB" to bytes.
+func parseSize(s string) (int64, error) {
+	s = strings.TrimSpace(strings.ToUpper(s))
+	if s == "" {
+		return 0, fmt.Errorf("empty size")
+	}
+	multiplier := int64(1)
+	switch {
+	case strings.HasSuffix(s, "GB"):
+		multiplier = 1024 * 1024 * 1024
+		s = strings.TrimSuffix(s, "GB")
+	case strings.HasSuffix(s, "MB"):
+		multiplier = 1024 * 1024
+		s = strings.TrimSuffix(s, "MB")
+	case strings.HasSuffix(s, "KB"):
+		multiplier = 1024
+		s = strings.TrimSuffix(s, "KB")
+	case strings.HasSuffix(s, "B"):
+		s = strings.TrimSuffix(s, "B")
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size: %q", s)
+	}
+	return n * multiplier, nil
 }
