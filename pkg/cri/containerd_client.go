@@ -175,6 +175,7 @@ type ContainerdClient struct {
 	configMgr *configManagerLookup // optional: for ConfigMap resolution
 	logs      *logStore
 	logCfgs   map[string]*types.LogConfig // containerID → persistent log config
+	logNames  map[string]string           // containerID → service name for log dirs
 }
 
 // configManagerLookup is a subset of ConfigManager used for runtime resolution.
@@ -204,6 +205,7 @@ func NewContainerdClient(socketPath, namespace string) (*ContainerdClient, error
 		namespace: namespace,
 		logs:      newLogStore(),
 		logCfgs:   make(map[string]*types.LogConfig),
+		logNames:  make(map[string]string),
 	}, nil
 }
 
@@ -505,9 +507,10 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 		return "", fmt.Errorf("failed to create container %s: %w", svc.Name, err)
 	}
 
-	// Store log config for use by StartContainer.
+	// Store log config and service name for use by StartContainer.
 	if svc.Log != nil && svc.Log.Enabled {
 		c.logCfgs[container.ID()] = svc.Log
+		c.logNames[container.ID()] = svc.Name
 	}
 
 	return container.ID(), nil
@@ -559,7 +562,11 @@ func (c *ContainerdClient) StartContainer(ctx context.Context, containerID strin
 		if maxFiles <= 0 {
 			maxFiles = 5
 		}
-		dir := filepath.Join("/var/lib/quartermaster/logs", containerID)
+		name := c.logNames[containerID]
+		if name == "" {
+			name = containerID
+		}
+		dir := filepath.Join("/var/lib/quartermaster/logs", name)
 		if rf, err := newRotatingFile(dir, maxBytes, maxFiles); err == nil {
 			logWriter = io.MultiWriter(rb, rf)
 			log.Printf("Persistent logging enabled for %s → %s", containerID, dir)
