@@ -124,6 +124,21 @@ func (f *DNSForwarder) handleDNS(w dns.ResponseWriter, r *dns.Msg) {
 		w.WriteMsg(m)
 		return
 	}
+
+	// ── Rule 1b: short hostname → bridge gateway (host) ─────────
+	//    Services on host networking (sonarr, radarr, jellyfin, etc.)
+	//    don't have bridge IPs but are reachable via the bridge GW.
+	if !strings.Contains(name, ".") {
+		f.mu.RUnlock()
+		rr := &dns.A{
+			Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+			A:   net.ParseIP(bridgeGW),
+		}
+		m.Answer = append(m.Answer, rr)
+		w.WriteMsg(m)
+		return
+	}
+
 	gwIP := f.gluetunIP
 	f.mu.RUnlock()
 
