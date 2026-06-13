@@ -434,7 +434,10 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 	//    and bind-mounts the DNS resolver.
 	var preparedNs string
 	var gatewayIP string // stored as label for staleness detection
-	if !useHostNet && c.netMgr != nil {
+	if !useHostNet {
+		if c.netMgr == nil {
+			return "", fmt.Errorf("network profile %q requires NetManager but none is configured", netProfile)
+		}
 		// Resolve VPN gateway (if any) for policy routing.
 		vpnGateway := resolveVPNGateway(c.netMgr, netProfile, svc.DependsOn)
 		netInfo, err := c.netMgr.Attach(svc.Name, netProfile, vpnGateway)

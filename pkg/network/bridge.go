@@ -418,11 +418,60 @@ func (b *BridgeManager) Recover() error {
 			b.mu.Lock()
 		}
 
+		// Clean stale DNAT rules pointing to IPs not in the current map.
+		// Prevents accumulation of dead rules across daemon restarts.
+		b.cleanStaleDNAT()
+
 		return nil
 	}
 
 	// No persisted file — scan existing netns (upgrade path).
 	return b.scanNetns()
+}
+
+// cleanStaleDNAT removes DNAT rules that point to bridge IPs not in the
+// current IP map.  Prevents dead rules from accumulating after container
+// recreates or IP changes.
+func (b *BridgeManager) cleanStaleDNAT() {
+	if b.ipt4 == nil {
+		return
+	}
+	validIPs := make(map[string]bool)
+	for _, ip := range b.ips {
+		validIPs[ip.String()] = true
+	}
+	for _, chain := range []string{"PREROUTING", "OUTPUT"} {
+		rules, err := b.ipt4.List("nat", chain)
+		if err != nil {
+			continue
+		}
+		for _, rule := range rules {
+			if !strings.Contains(rule, "--to-destination") {
+				continue
+			}
+			// Extract the destination IP from the rule.
+			idx := strings.Index(rule, "--to-destination")
+			if idx < 0 {
+				continue
+			}
+			rest := strings.Fields(rule[idx:])
+			if len(rest) < 2 {
+				continue
+			}
+			dest := rest[1] // e.g. "10.42.0.92:8080"
+			if colon := strings.LastIndex(dest, ":"); colon > 0 {
+				dest = dest[:colon]
+			}
+			// Check if it's a bridge IP we don't know about.
+			if strings.HasPrefix(dest, "10.42.0.") && !validIPs[dest] {
+				args := ruleToDeleteArgs(rule, dest)
+				if args != nil {
+					b.ipt4.Delete("nat", chain, args...)
+					log.Printf("Cleaned stale DNAT %s rule: %s (IP not in bridge map)", chain, dest)
+				}
+			}
+		}
+	}
 }
 
 // RecoverVPNRouting re-applies the fwmark-based VPN routing for all
@@ -757,6 +806,25 @@ func (b *BridgeManager) ExposePorts(containerName string, containerIP net.IP, po
 		}
 		dport := fmt.Sprintf("%d", p.Host)
 		to := fmt.Sprintf("%s:%d", ipStr, p.Container)
+
+		// Clean any stale DNAT rules for this port that point to a
+		// different IP.  Prevents accumulation of dead rules when a
+		// container's bridge IP changes across recreates.
+		for _, chain := range []string{"PREROUTING", "OUTPUT"} {
+			rules, _ := b.ipt4.List("nat", chain)
+			for _, rule := range rules {
+				if strings.Contains(rule, fmt.Sprintf("dpt:%s", dport)) &&
+					strings.Contains(rule, "--to-destination") &&
+					!strings.Contains(rule, ipStr) {
+					args := ruleToDeleteArgs(rule, ipStr)
+					if args != nil {
+						b.ipt4.Delete("nat", chain, args...)
+						log.Printf("Cleaned stale DNAT %s rule for port %s (was pointing to old IP)", chain, dport)
+					}
+				}
+			}
+		}
+
 		args := []string{"-p", proto, "--dport", dport, "-j", "DNAT", "--to-destination", to}
 		exists, _ := b.ipt4.Exists("nat", "PREROUTING", args...)
 		if exists {
