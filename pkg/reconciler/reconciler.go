@@ -409,9 +409,12 @@ func (r *Reconciler) regenerateIngress(desiredMap map[string]types.Service) {
 	}
 	for name, svc := range desiredMap {
 		ip := r.netMgr.LookupIP(name)
-		// Host-networked services use localhost (they bind to host ports).
+		// Host-networked services use the bridge gateway IP (10.42.0.1)
+		// instead of 127.0.0.1 so bridge containers can also reach them
+		// via the hosts file.  127.0.0.1 inside a bridge container is
+		// the container's own loopback, not the host.
 		if ip == nil && (svc.Network == "public" || svc.Network == "") {
-			ip = net.ParseIP("127.0.0.1")
+			ip = net.ParseIP("10.42.0.1") // bridge GW → host, works from bridge containers too
 		}
 		entry := ingress.ServiceEntry{
 			Name:       name,
