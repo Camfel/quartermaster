@@ -946,13 +946,30 @@ func (b *BridgeManager) setupVPNRouting(nsName, containerIP, gatewayIP, ctrVeth 
 	// uses table 100 which routes through the VPN gateway.  This is
 	// more reliable than fwmark-based routing which can lose marks
 	// across bridge forwarding on some kernels.
-	defaultRoute := &netlink.Route{
-		Dst:   &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)},
-		Gw:    gw,
-		Table: vpnRouteTable,
-	}
-	if err := handle.RouteAdd(defaultRoute); err != nil && !os.IsExist(err) {
-		return fmt.Errorf("add default route via %s: %w", gatewayIP, err)
+
+	// Direct routes: bridge, LAN, and Tailscale subnets bypass the VPN
+	// so responses to the host and local network are not tunneled.
+	_, bridgeNet, _ := net.ParseCIDR(bridgeSubnet)
+	_, lanNet, _ := net.ParseCIDR("192.168.0.0/24")
+	_, tailscaleNet, _ := net.ParseCIDR("100.64.0.0/10")
+
+	for _, entry := range []struct {
+		dst *net.IPNet
+		gw  net.IP
+	}{
+		{bridgeNet, nil},                         // bridge — direct L2
+		{lanNet, net.ParseIP(bridgeGW)},           // LAN — via bridge GW to host
+		{tailscaleNet, net.ParseIP(bridgeGW)},     // Tailscale — via bridge GW to host
+		{&net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}, gw}, // internet via VPN
+	} {
+		route := &netlink.Route{
+			Dst:   entry.dst,
+			Gw:    entry.gw,
+			Table: vpnRouteTable,
+		}
+		if err := handle.RouteAdd(route); err != nil && !os.IsExist(err) {
+			return fmt.Errorf("add route to table %d: %w", vpnRouteTable, err)
+		}
 	}
 
 	src, _ := netlink.ParseIPNet(containerIP + "/32")
