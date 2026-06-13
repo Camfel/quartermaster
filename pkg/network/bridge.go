@@ -959,7 +959,7 @@ func (b *BridgeManager) setupVPNRouting(nsName, containerIP, gatewayIP, ctrVeth 
 	// Bridge-local (10.42.0.0/24) stays unmarked, routed through main table.
 	mangleArgs := []string{"!", "-d", bridgeSubnet, "-j", "MARK", "--set-mark", "100"}
 	if exists, _ := b.ipt4.Exists("mangle", "OUTPUT", mangleArgs...); !exists {
-		if err := b.ipt4.Insert("mangle", "OUTPUT", 1, mangleArgs...); err != nil {
+		if err := b.ipt4.Insert("mangle", "OUTPUT", 2, mangleArgs...); err != nil {
 			return fmt.Errorf("add mangle mark rule in %s: %w", nsName, err)
 		}
 		log.Printf("VPN mangle mark: %s → fwmark 100 (bridge/LAN direct)", containerIP)
