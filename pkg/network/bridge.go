@@ -309,11 +309,9 @@ func (b *BridgeManager) Attach(serviceName string, profile string, vpnGateway st
 
 // Detach implements NetManager.  Removes the namespace, veth pair, DNAT
 // rules, VPN policy routes, and releases the IP.
+// Always attempts cleanup regardless of profile — checks for resources
+// defensively so stale state is cleaned even after daemon restarts.
 func (b *BridgeManager) Detach(serviceName string, profile string) error {
-	p := NormaliseProfile(profile)
-	if p == ProfilePublic {
-		return nil
-	}
 
 	short := ShortName(serviceName)
 	nsName := "qm-" + short

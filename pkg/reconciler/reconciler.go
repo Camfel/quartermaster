@@ -106,10 +106,10 @@ func (r *Reconciler) ReconcileStack(ctx context.Context, stack *types.Stack) err
 			// Service is missing -> Create it.  Detach any stale
 			// network resources first (veth, DNAT rules) in case a
 			// previous container was deleted without proper teardown.
-			if prevProfile, ok := r.serviceProfiles[svc.Name]; ok && r.netMgr != nil {
-				if err := r.netMgr.Detach(svc.Name, prevProfile); err != nil {
-					log.Printf("Warning: defensive detach for %s: %v", svc.Name, err)
-				}
+			// Always attempt detach — the function checks defensively.
+			if r.netMgr != nil {
+				prevProfile := r.serviceProfiles[svc.Name]
+				r.netMgr.Detach(svc.Name, prevProfile)
 				delete(r.serviceProfiles, svc.Name)
 			}
 			log.Printf("Service %s is missing. Creating...", svc.Name)
@@ -236,15 +236,13 @@ func (r *Reconciler) runCreateFlow(ctx context.Context, svc types.Service, runni
 }
 
 func (r *Reconciler) runDeleteFlow(ctx context.Context, containerID, name string) error {
-	// Detach network namespace (bridge veth, DNAT rules, VPN policy routes).
+	// Always attempt network detach — Detach checks defensively for
+	// resources (netns, bridge IP, DNAT rules) regardless of profile.
+	// This handles the case where serviceProfiles is empty after a
+	// daemon restart or a profile changed between create and delete.
 	if r.netMgr != nil {
 		profile := r.serviceProfiles[name]
-		if profile == "" {
-			profile = "public"
-		}
-		if err := r.netMgr.Detach(name, profile); err != nil {
-			log.Printf("Warning: network detach for %s failed: %v", name, err)
-		}
+		r.netMgr.Detach(name, profile)
 		delete(r.serviceProfiles, name)
 	}
 	return r.containerClient.DeleteContainer(ctx, containerID)
