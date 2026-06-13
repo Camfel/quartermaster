@@ -901,16 +901,14 @@ func ruleToDeleteArgs(rule, ipStr string) []string {
 			continue
 		}
 		switch p {
-		case "-A", "PREROUTING", "-m", "tcp", "udp":
-			// Skip chain name and redundant proto module spec.
-			if p == "-m" {
-				skipNext = true
-			}
+		case "-A", "PREROUTING", "OUTPUT":
+			continue
+		case "-m":
+			skipNext = true
 			continue
 		case "-p", "--dport", "-j", "--to-destination":
 			args = append(args, p)
 		default:
-			// Argument to previous flag.
 			args = append(args, p)
 		}
 	}
