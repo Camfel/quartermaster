@@ -446,10 +446,9 @@ func (b *BridgeManager) cleanStaleDNAT() {
 			continue
 		}
 		for _, rule := range rules {
-			if !strings.Contains(rule, "--to-destination") {
+			if !strings.Contains(rule, "--to-destination") || !strings.Contains(rule, "10.42.0.") {
 				continue
 			}
-			// Extract the destination IP from the rule.
 			idx := strings.Index(rule, "--to-destination")
 			if idx < 0 {
 				continue
@@ -458,16 +457,28 @@ func (b *BridgeManager) cleanStaleDNAT() {
 			if len(rest) < 2 {
 				continue
 			}
-			dest := rest[1] // e.g. "10.42.0.92:8080"
+			dest := rest[1]
 			if colon := strings.LastIndex(dest, ":"); colon > 0 {
 				dest = dest[:colon]
 			}
-			// Check if it's a bridge IP we don't know about.
-			if strings.HasPrefix(dest, "10.42.0.") && !validIPs[dest] {
-				args := ruleToDeleteArgs(rule, dest)
-				if args != nil {
-					b.ipt4.Delete("nat", chain, args...)
-					log.Printf("Cleaned stale DNAT %s rule: %s (IP not in bridge map)", chain, dest)
+			if !validIPs[dest] {
+				// Parse port and protocol from the iptables list output.
+				// Format: "-A CHAIN -p tcp -m tcp --dport 9696 -j DNAT --to-destination 10.42.0.97:9696"
+				proto := "tcp"
+				if strings.Contains(rule, "-p udp") {
+					proto = "udp"
+				}
+				dport := ""
+				if dpIdx := strings.Index(rule, "--dport "); dpIdx >= 0 {
+					dport = strings.Fields(rule[dpIdx:])[1]
+				}
+				if dport != "" {
+					args := []string{"-p", proto, "--dport", dport, "-j", "DNAT", "--to-destination", rest[1]}
+					if err := b.ipt4.Delete("nat", chain, args...); err != nil {
+						log.Printf("Warning: cleanStaleDNAT %s: %v", chain, err)
+					} else {
+						log.Printf("Cleaned stale DNAT %s rule: %s (IP not in bridge map)", chain, dest)
+					}
 				}
 			}
 		}
