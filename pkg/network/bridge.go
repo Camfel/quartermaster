@@ -481,9 +481,17 @@ func (b *BridgeManager) RecoverVPNRouting(vpnGateway string) error {
 			continue
 		}
 
+		// Rule 1: RETURN for established connections so response
+		// packets to the host/laptop aren't routed through the VPN.
+		ctArgs := []string{"-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "RETURN"}
+		if exists, _ := ipt.Exists("mangle", "OUTPUT", ctArgs...); !exists {
+			ipt.Insert("mangle", "OUTPUT", 1, ctArgs...)
+		}
+
+		// Rule 2: mark new outbound connections for VPN routing.
 		mangleArgs := []string{"!", "-d", bridgeSubnet, "-j", "MARK", "--set-mark", "100"}
 		if exists, _ := ipt.Exists("mangle", "OUTPUT", mangleArgs...); !exists {
-			if err := ipt.Insert("mangle", "OUTPUT", 1, mangleArgs...); err != nil {
+			if err := ipt.Insert("mangle", "OUTPUT", 2, mangleArgs...); err != nil {
 				log.Printf("Warning: mangle insert for %s: %v", name, err)
 			} else {
 				log.Printf("Recovered VPN mangle rule for %s", name)
@@ -865,7 +873,14 @@ func (b *BridgeManager) setupVPNRouting(nsName, containerIP, gatewayIP, ctrVeth 
 	}
 
 	// iptables runs inside the container's namespace.
-	// Rule: mark all non-bridge traffic with fwmark 100.
+	// Rule 1: RETURN established connections so responses to host/laptop
+	// are not routed through the VPN tunnel.
+	ctArgs := []string{"-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "RETURN"}
+	if exists, _ := b.ipt4.Exists("mangle", "OUTPUT", ctArgs...); !exists {
+		b.ipt4.Insert("mangle", "OUTPUT", 1, ctArgs...)
+	}
+
+	// Rule 2: mark all non-bridge traffic with fwmark 100.
 	// Bridge-local (10.42.0.0/24) stays unmarked, routed through main table.
 	mangleArgs := []string{"!", "-d", bridgeSubnet, "-j", "MARK", "--set-mark", "100"}
 	if exists, _ := b.ipt4.Exists("mangle", "OUTPUT", mangleArgs...); !exists {
@@ -900,6 +915,8 @@ func (b *BridgeManager) teardownVPNRouting(nsName, containerIP string) {
 	defer netns.Set(origNs)
 
 	netns.Set(nsHandle)
+	ctArgs := []string{"-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "RETURN"}
+	b.ipt4.Delete("mangle", "OUTPUT", ctArgs...)
 	mangleArgs := []string{"!", "-d", bridgeSubnet, "-j", "MARK", "--set-mark", "100"}
 	b.ipt4.Delete("mangle", "OUTPUT", mangleArgs...)
 	log.Printf("Removed VPN mangle rule for %s", containerIP)
