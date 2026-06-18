@@ -15,6 +15,10 @@ import (
 )
 
 func TestWatcher_Start(t *testing.T) {
+	// Git 2.35.2+ enforces directory ownership checks.  CI runners clone into
+	// a different user's directory, so we need to mark all dirs as safe.
+	exec.Command("git", "config", "--global", "--add", "safe.directory", "*").Run()
+
 	// Create a temporary directory for our "remote" and our "local"
 	tmpDir, err := os.MkdirTemp("", "watcher-test-*")
 	require.NoError(t, err)
