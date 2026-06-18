@@ -7,12 +7,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"quartermaster/pkg/config"
 	"quartermaster/pkg/secrets"
 
+	"github.com/go-git/go-git/v5"
 	"github.com/spf13/cobra"
 )
 
@@ -39,6 +41,8 @@ func main() {
 		newStatusCmd(&socketPath),
 		newSecretCmd(),
 		newServiceCmd(&socketPath),
+		newComponentsCmd(),
+		newEnableCmd(),
 	)
 
 	root.Version = version
@@ -348,4 +352,212 @@ func httpPost(socketOverride, urlPath string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 	return io.ReadAll(resp.Body)
+}
+
+// ── components ──────────────────────────────────────────────────────────
+
+func newComponentsCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "components",
+		Short: "Manage curated components (reverse proxy, VPN, monitoring)",
+	}
+	cmd.AddCommand(newComponentsListCmd())
+	return cmd
+}
+
+func newComponentsListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "list",
+		Short: "List available components and their enabled status",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			settingsPath := config.DefaultSettingsPath()
+			settings, err := config.LoadSettings(settingsPath)
+			if err != nil {
+				return fmt.Errorf("loading settings: %w", err)
+			}
+
+			if settings.ComponentsRepo == "" {
+				fmt.Printf("components_repo is not configured in %s.\n", settingsPath)
+				fmt.Println("Enable a component to auto-configure it:")
+				fmt.Println("  qm enable vpn")
+				return nil
+			}
+
+			localBase := filepath.Join(filepath.Dir(settings.LKGPath), "components")
+			repoDir := filepath.Join(localBase, "repo")
+
+			if err := cloneOrPull(settings.ComponentsRepo, repoDir); err != nil {
+				return fmt.Errorf("fetching components: %w", err)
+			}
+
+			entries, err := os.ReadDir(repoDir)
+			if err != nil {
+				return fmt.Errorf("reading components repo: %w", err)
+			}
+
+			fmt.Println("Available components:")
+			for _, entry := range entries {
+				if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+					continue
+				}
+				name := entry.Name()
+				compDir := filepath.Join(repoDir, name)
+
+				verEntries, err := os.ReadDir(compDir)
+				if err != nil {
+					continue
+				}
+				var versions []string
+				for _, ve := range verEntries {
+					if ve.IsDir() {
+						sf := filepath.Join(compDir, ve.Name(), "stack.yaml")
+						if _, err := os.Stat(sf); err == nil {
+							versions = append(versions, ve.Name())
+						}
+					}
+				}
+				if len(versions) == 0 {
+					continue
+				}
+
+				comp, enabled := settings.Components[name]
+				status := "  disabled"
+				ver := ""
+				if enabled && comp.Enabled {
+					status = "✓ enabled"
+					ver = comp.Version
+				}
+				if ver == "" {
+					ver = versions[0]
+				}
+
+				fmt.Printf("  %-22s %s  (version: %s, available: %s)\n", name, status, ver, strings.Join(versions, ", "))
+			}
+			fmt.Println()
+			fmt.Println("Enable a component with: qm enable <name>")
+			return nil
+		},
+	}
+}
+
+// ── enable ──────────────────────────────────────────────────────────────
+
+func newEnableCmd() *cobra.Command {
+	var compVersion string
+
+	cmd := &cobra.Command{
+		Use:   "enable <name>",
+		Short: "Enable a curated component",
+		Long: `Enable a component from the quartermaster-components repository.
+
+The component's stack.yaml is merged with your stacks.  User services
+take precedence on name conflicts.
+
+Reload the daemon to apply:
+  sudo systemctl reload qm-daemon`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			settingsPath := config.DefaultSettingsPath()
+			settings, err := config.LoadSettings(settingsPath)
+			if err != nil {
+				return fmt.Errorf("loading settings: %w", err)
+			}
+
+			if settings.ComponentsRepo == "" {
+				settings.ComponentsRepo = "https://github.com/Camfel/quartermaster-components"
+			}
+
+			localBase := filepath.Join(filepath.Dir(settings.LKGPath), "components")
+			repoDir := filepath.Join(localBase, "repo")
+			if err := cloneOrPull(settings.ComponentsRepo, repoDir); err != nil {
+				return fmt.Errorf("fetching components: %w", err)
+			}
+
+			compDir := filepath.Join(repoDir, name)
+			if info, err := os.Stat(compDir); err != nil || !info.IsDir() {
+				return fmt.Errorf("component %q not found in %s.\nRun 'qm components list' to see available components.", name, settings.ComponentsRepo)
+			}
+
+			version := compVersion
+			if version == "" {
+				verEntries, err := os.ReadDir(compDir)
+				if err != nil {
+					return fmt.Errorf("reading component %q: %w", name, err)
+				}
+				for _, ve := range verEntries {
+					if ve.IsDir() {
+						sf := filepath.Join(compDir, ve.Name(), "stack.yaml")
+						if _, err := os.Stat(sf); err == nil {
+							version = ve.Name()
+							break
+						}
+					}
+				}
+			}
+			if version == "" {
+				return fmt.Errorf("no version found for component %q", name)
+			}
+
+			if settings.Components == nil {
+				settings.Components = make(config.ComponentsConfig)
+			}
+			existing := settings.Components[name]
+			existing.Enabled = true
+			if existing.Version == "" {
+				existing.Version = version
+			}
+			settings.Components[name] = existing
+
+			if err := config.SaveSettings(settingsPath, settings); err != nil {
+				return fmt.Errorf("saving settings: %w", err)
+			}
+
+			fmt.Printf("✓ Component %q enabled (version: %s)\n", name, existing.Version)
+			fmt.Println()
+			fmt.Println("Reload the daemon to apply:")
+			fmt.Println("  sudo systemctl reload qm-daemon")
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVarP(&compVersion, "version", "v", "", "Component version (default: latest available)")
+	return cmd
+}
+
+// ── Git helper ──────────────────────────────────────────────────────────
+
+// cloneOrPull ensures the repo exists at dir, cloning if absent or pulling if present.
+func cloneOrPull(repoURL, dir string) error {
+	if info, err := os.Stat(filepath.Join(dir, ".git")); err == nil && info.IsDir() {
+		repo, err := git.PlainOpen(dir)
+		if err != nil {
+			return fmt.Errorf("opening repo at %s: %w", dir, err)
+		}
+		wt, err := repo.Worktree()
+		if err != nil {
+			return fmt.Errorf("worktree: %w", err)
+		}
+		if err := wt.Pull(&git.PullOptions{
+			RemoteName: "origin",
+		}); err != nil && err != git.NoErrAlreadyUpToDate {
+			os.RemoveAll(dir)
+		} else {
+			return nil
+		}
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dir), 0755); err != nil {
+		return err
+	}
+	os.RemoveAll(dir)
+
+	_, err := git.PlainClone(dir, false, &git.CloneOptions{
+		URL:   repoURL,
+		Depth: 1,
+	})
+	if err != nil {
+		return fmt.Errorf("cloning %s: %w", repoURL, err)
+	}
+	return nil
 }

@@ -421,6 +421,20 @@ func (r *RepoConfig) Validate() error {
 
 // ── Serialisation helpers ────────────────────────────────────────────────
 
+// SaveSettings writes settings to path as indented JSON with 0644 permissions.
+func SaveSettings(path string, s *Settings) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal settings: %w", err)
+	}
+	data = append(data, '\n')
+	return os.WriteFile(path, data, 0644)
+}
+
 // WriteDefault writes a well-commented default settings file to path.
 // Existing files are not overwritten.
 func WriteDefault(path string) error {
