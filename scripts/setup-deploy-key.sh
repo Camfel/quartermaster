@@ -108,7 +108,10 @@ KNOWN_HOSTS="${KEY_DIR}/known_hosts"
 
 # ── Create key directory ──────────────────────────────────────────────────
 sudo mkdir -p "$KEY_DIR"
-sudo chown "$(whoami)" "$KEY_DIR" 2>/dev/null || true
+# Ensure the quartermaster daemon user can read the keys.
+if id quartermaster >/dev/null 2>&1; then
+    sudo chown quartermaster:quartermaster "$KEY_DIR" 2>/dev/null || true
+fi
 chmod 700 "$KEY_DIR"
 
 # ── Generate SSH key ──────────────────────────────────────────────────────
@@ -120,6 +123,10 @@ else
     ssh-keygen -t ed25519 -C "quartermaster-${REPO}" -N "" -f "$PRIVATE_KEY" -q
     chmod 600 "$PRIVATE_KEY"
     chmod 644 "$PUBLIC_KEY"
+    # Ensure the quartermaster daemon user can read the keys.
+    if id quartermaster >/dev/null 2>&1; then
+        sudo chown quartermaster:quartermaster "$PRIVATE_KEY" "$PUBLIC_KEY" 2>/dev/null || true
+    fi
     echo "✓ Key generated"
 fi
 
