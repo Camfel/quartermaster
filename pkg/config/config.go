@@ -68,6 +68,23 @@ func (cm *ConfigManager) SaveStack(path string, stack *types.Stack) error {
 	return nil
 }
 
+// MergeStacks combines two stacks into one. Services from the second stack
+// are appended to the first.  The first stack's metadata is preserved.
+// Duplicate service names: the first stack wins.
+func (cm *ConfigManager) MergeStacks(base, additional *types.Stack) *types.Stack {
+	seen := make(map[string]bool, len(base.Spec.Services))
+	for _, svc := range base.Spec.Services {
+		seen[svc.Name] = true
+	}
+	for _, svc := range additional.Spec.Services {
+		if !seen[svc.Name] {
+			base.Spec.Services = append(base.Spec.Services, svc)
+			seen[svc.Name] = true
+		}
+	}
+	return base
+}
+
 // validRestartPolicies defines the allowed restart policy values.
 var validRestartPolicies = map[string]bool{
 	"always":         true,

@@ -222,11 +222,26 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 	}
 	defer cancel()
 
+	// Merge all stack files (components + repos) into a single combined stack.
 	stack, err := d.configManager.LoadStack(d.stackFile)
 	if err != nil {
 		recordReconcile(d.status, err)
-		log.Printf("Failed to load stack: %v", err)
+		log.Printf("Failed to load primary stack: %v", err)
 		return fmt.Errorf("failed to load desired state: %w", err)
+	}
+
+	// Merge any additional stack files from settings into the primary stack.
+	if settings, sErr := config.LoadSettings(d.settingsPath); sErr == nil {
+		files := settings.StackFiles()
+		if len(files) > 1 {
+			for _, f := range files[1:] {
+				if additional, aErr := d.configManager.LoadStack(f); aErr == nil {
+					stack = d.configManager.MergeStacks(stack, additional)
+				} else {
+					log.Printf("Warning: skipping stack %s: %v", f, aErr)
+				}
+			}
+		}
 	}
 
 	err = d.reconciler.ReconcileStack(reconCtx, stack)
