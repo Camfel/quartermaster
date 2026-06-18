@@ -563,7 +563,7 @@ Examples:
   qm config set ingress.domain example.com
   qm config set ingress.tls letsencrypt
 
-Supported keys: ingress.domain, ingress.tls, sync_interval`,
+Supported keys: ingress.domain, ingress.tls, ingress.exclude_services, sync_interval`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			key, value := args[0], args[1]
@@ -581,6 +581,12 @@ Supported keys: ingress.domain, ingress.tls, sync_interval`,
 					return fmt.Errorf("ingress.tls must be 'internal' or 'letsencrypt'")
 				}
 				s.Ingress.TLS = value
+			case "ingress.exclude_services":
+				if value == "" || value == "[]" {
+					s.Ingress.ExcludeServices = nil
+				} else {
+					s.Ingress.ExcludeServices = strings.Split(value, ",")
+				}
 			case "sync_interval":
 				s.SyncInterval = value
 			default:

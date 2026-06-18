@@ -28,6 +28,7 @@ type Reconciler struct {
 
 	ingressDomain string
 	ingressTLS    string
+	ingressExclude map[string]bool
 
 	// serviceProfiles tracks the network profile of each created service
 	// so Detach can be called on deletion.
@@ -49,9 +50,13 @@ func (r *Reconciler) SetNetManager(nm network.NetManager) {
 }
 
 // SetIngressConfig sets the domain and TLS mode for Caddy ingress generation.
-func (r *Reconciler) SetIngressConfig(domain, tlsMode string) {
+func (r *Reconciler) SetIngressConfig(domain, tlsMode string, exclude []string) {
 	r.ingressDomain = domain
 	r.ingressTLS = tlsMode
+	r.ingressExclude = make(map[string]bool, len(exclude))
+	for _, s := range exclude {
+		r.ingressExclude[s] = true
+	}
 }
 
 // Reconcile performs a single reconciliation pass using a config file path.
@@ -330,6 +335,10 @@ func (r *Reconciler) regenerateIngress(desiredMap map[string]types.Service) {
 	var entries []ingress.ServiceEntry
 	for _, svc := range desiredMap {
 		if svc.Ingress == nil {
+			continue
+		}
+		// Skip services on the ingress exclude list.
+		if r.ingressExclude[svc.Ingress.Host] {
 			continue
 		}
 		var ip net.IP

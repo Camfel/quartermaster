@@ -418,7 +418,7 @@ func (d *Daemon) reload(ctx context.Context) error {
 	if len(files) > 0 {
 		d.stackFile = files[0]
 	}
-	d.reconciler.SetIngressConfig(settings.Ingress.Domain, settings.Ingress.TLS)
+	d.reconciler.SetIngressConfig(settings.Ingress.Domain, settings.Ingress.TLS, settings.Ingress.ExcludeServices)
 	log.Printf("Reloaded settings: stack = %s, ingress = %s/%s", d.stackFile, settings.Ingress.Domain, settings.Ingress.TLS)
 	return nil
 }

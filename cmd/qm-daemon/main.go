@@ -115,7 +115,7 @@ func main() {
 
 	r := reconciler.NewReconciler(cc, cm)
 	r.SetNetManager(netMgr)
-	r.SetIngressConfig(settings.Ingress.Domain, settings.Ingress.TLS)
+	r.SetIngressConfig(settings.Ingress.Domain, settings.Ingress.TLS, settings.Ingress.ExcludeServices)
 
 	// Channel for git watchers to signal changes.
 	gitChangeCh := make(chan struct{}, 1)

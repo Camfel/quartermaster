@@ -83,6 +83,10 @@ type IngressSettings struct {
 	// TLS is the TLS provisioning mode: "internal" (self-signed, localhost)
 	// or "letsencrypt" (real certs via ACME).  Default: "internal".
 	TLS string `json:"tls"`
+
+	// ExcludeServices lists service ingress.host names to skip when
+	// generating the Caddyfile (e.g. ["dash", "gotify"]).
+	ExcludeServices []string `json:"exclude_services,omitempty"`
 }
 
 // AlertingSettings controls push notification delivery via Gotify.
