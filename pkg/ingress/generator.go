@@ -85,12 +85,10 @@ func generateCaddyfile(services []ServiceEntry, domain string, tlsMode string) e
 				host = host + "." + domain
 			}
 			buf.WriteString(fmt.Sprintf("%s {\n", host))
-			// JSON access logging to stdout (captured by persistent logging).
-			buf.WriteString("\tlog {\n\t\toutput stdout\n\t\tformat json\n\t}\n")
-			buf.WriteString("\thandle /.well-known/* {\n\t\trespond 200\n\t}\n")
-			buf.WriteString("\thandle /healthz {\n\t\trespond \"OK\" 200\n\t}\n")
-			writeAuth(&buf, s, authIP)
-			buf.WriteString(fmt.Sprintf("\thandle {\n\t\t\treverse_proxy %s:%d\n\t\t}\n", s.IP.String(), s.Ingress.Port))
+			if s.Ingress.Auth && authIP != "" {
+				writeAuth(&buf, s, authIP)
+			}
+			buf.WriteString(fmt.Sprintf("\treverse_proxy %s:%d\n", s.IP.String(), s.Ingress.Port))
 			buf.WriteString("}\n\n")
 		}
 		// If authelia is running, add its own block.
@@ -112,7 +110,9 @@ func generateCaddyfile(services []ServiceEntry, domain string, tlsMode string) e
 			hasIngress = true
 			route := "/" + s.Ingress.Host + "/*"
 			buf.WriteString(fmt.Sprintf("    handle_path %s {\n", route))
-			writeAuth(&buf, s, authIP)
+			if s.Ingress.Auth && authIP != "" {
+				writeAuth(&buf, s, authIP)
+			}
 			buf.WriteString(fmt.Sprintf("        reverse_proxy %s:%d\n", s.IP.String(), s.Ingress.Port))
 			buf.WriteString("    }\n")
 		}
