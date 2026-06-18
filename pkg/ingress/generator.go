@@ -90,7 +90,7 @@ func generateCaddyfile(services []ServiceEntry, domain string, tlsMode string) e
 			buf.WriteString("\thandle /.well-known/* {\n\t\trespond 200\n\t}\n")
 			buf.WriteString("\thandle /healthz {\n\t\trespond \"OK\" 200\n\t}\n")
 			writeAuth(&buf, s, authIP)
-			buf.WriteString(fmt.Sprintf("\treverse_proxy %s:%d\n", s.IP.String(), s.Ingress.Port))
+			buf.WriteString(fmt.Sprintf("\thandle {\n\t\t\treverse_proxy %s:%d\n\t\t}\n", s.IP.String(), s.Ingress.Port))
 			buf.WriteString("}\n\n")
 		}
 		// If authelia is running, add its own block.
