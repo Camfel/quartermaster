@@ -43,6 +43,7 @@ func main() {
 		newServiceCmd(&socketPath),
 		newComponentsCmd(),
 		newEnableCmd(),
+		newConfigCmd(),
 	)
 
 	root.Version = version
@@ -519,6 +520,81 @@ Reload the daemon to apply:
 
 	cmd.Flags().StringVarP(&compVersion, "version", "v", "", "Component version (default: latest available)")
 	return cmd
+}
+
+// ── config ──────────────────────────────────────────────────────────────
+
+func newConfigCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "config",
+		Short: "View and manage daemon settings",
+	}
+	cmd.AddCommand(
+		newConfigShowCmd(),
+		newConfigSetCmd(),
+	)
+	return cmd
+}
+
+func newConfigShowCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "show",
+		Short: "Show current daemon settings",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			settingsPath := config.DefaultSettingsPath()
+			s, err := config.LoadSettings(settingsPath)
+			if err != nil {
+				return fmt.Errorf("loading settings: %w", err)
+			}
+			data, _ := json.MarshalIndent(s, "", "  ")
+			fmt.Println(string(data))
+			return nil
+		},
+	}
+}
+
+func newConfigSetCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "set <key> <value>",
+		Short: "Set a daemon setting (e.g. ingress.domain, ingress.tls)",
+		Long: `Update a top-level setting in the daemon configuration.
+
+Examples:
+  qm config set ingress.domain example.com
+  qm config set ingress.tls letsencrypt
+
+Supported keys: ingress.domain, ingress.tls, sync_interval`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			key, value := args[0], args[1]
+			settingsPath := config.DefaultSettingsPath()
+			s, err := config.LoadSettings(settingsPath)
+			if err != nil {
+				return fmt.Errorf("loading settings: %w", err)
+			}
+
+			switch key {
+			case "ingress.domain":
+				s.Ingress.Domain = value
+			case "ingress.tls":
+				if value != "internal" && value != "letsencrypt" {
+					return fmt.Errorf("ingress.tls must be 'internal' or 'letsencrypt'")
+				}
+				s.Ingress.TLS = value
+			case "sync_interval":
+				s.SyncInterval = value
+			default:
+				return fmt.Errorf("unknown setting %q. Supported: ingress.domain, ingress.tls, sync_interval", key)
+			}
+
+			if err := config.SaveSettings(settingsPath, s); err != nil {
+				return fmt.Errorf("saving settings: %w", err)
+			}
+			fmt.Printf("✓ %s = %s\n", key, value)
+			fmt.Println("Reload the daemon to apply: sudo systemctl reload qm-daemon")
+			return nil
+		},
+	}
 }
 
 // ── Git helper ──────────────────────────────────────────────────────────
