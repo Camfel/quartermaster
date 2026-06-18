@@ -26,6 +26,9 @@ type Reconciler struct {
 	configManager   *config.ConfigManager
 	netMgr          network.NetManager
 
+	ingressDomain string
+	ingressTLS    string
+
 	// serviceProfiles tracks the network profile of each created service
 	// so Detach can be called on deletion.
 	serviceProfiles map[string]string
@@ -43,6 +46,12 @@ func NewReconciler(cc cri.ContainerClient, cm *config.ConfigManager) *Reconciler
 // SetNetManager attaches a network manager for bridge/IPAM/VPN routing.
 func (r *Reconciler) SetNetManager(nm network.NetManager) {
 	r.netMgr = nm
+}
+
+// SetIngressConfig sets the domain and TLS mode for Caddy ingress generation.
+func (r *Reconciler) SetIngressConfig(domain, tlsMode string) {
+	r.ingressDomain = domain
+	r.ingressTLS = tlsMode
 }
 
 // Reconcile performs a single reconciliation pass using a config file path.
@@ -346,8 +355,7 @@ func (r *Reconciler) regenerateIngress(desiredMap map[string]types.Service) {
 		return
 	}
 
-	// Use host networking as default domain / TLS mode.
-	if err := ingress.GenerateAll(entries, "", ""); err != nil {
+	if err := ingress.GenerateAll(entries, r.ingressDomain, r.ingressTLS); err != nil {
 		log.Printf("Warning: ingress generation failed: %v", err)
 	}
 }

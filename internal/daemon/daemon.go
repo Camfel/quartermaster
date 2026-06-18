@@ -418,7 +418,8 @@ func (d *Daemon) reload(ctx context.Context) error {
 	if len(files) > 0 {
 		d.stackFile = files[0]
 	}
-	log.Printf("Reloaded settings: stack file = %s", d.stackFile)
+	d.reconciler.SetIngressConfig(settings.Ingress.Domain, settings.Ingress.TLS)
+	log.Printf("Reloaded settings: stack = %s, ingress = %s/%s", d.stackFile, settings.Ingress.Domain, settings.Ingress.TLS)
 	return nil
 }
 

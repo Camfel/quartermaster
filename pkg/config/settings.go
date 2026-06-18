@@ -57,6 +57,9 @@ type Settings struct {
 
 	// Alerting controls push notifications via Gotify.
 	Alerting AlertingSettings `json:"alerting"`
+
+	// Ingress controls the Caddy reverse-proxy configuration.
+	Ingress IngressSettings `json:"ingress"`
 }
 
 // MetricsSettings controls exposure of the /v1/metrics endpoint.
@@ -68,6 +71,18 @@ type MetricsSettings struct {
 	// ListenAddr is the TCP address the metrics HTTP server binds to.
 	// Bind to 127.0.0.1 only — never expose metrics to the network.
 	ListenAddr string `json:"listen_addr"`
+}
+
+// IngressSettings controls Caddy reverse-proxy configuration.
+type IngressSettings struct {
+	// Domain is the base domain for service hostnames (e.g. "example.com").
+	// When set, hostnames become <service>.<domain> (e.g. media.example.com).
+	// When empty, internal TLS mode is used (localhost only).
+	Domain string `json:"domain"`
+
+	// TLS is the TLS provisioning mode: "internal" (self-signed, localhost)
+	// or "letsencrypt" (real certs via ACME).  Default: "internal".
+	TLS string `json:"tls"`
 }
 
 // AlertingSettings controls push notification delivery via Gotify.
@@ -478,6 +493,10 @@ const defaultSettingsJSON = `{
   "alerting": {
     "gotify_url": "",
     "gotify_token": ""
+  },
+  "ingress": {
+    "domain": "",
+    "tls": "internal"
   },
   "components": {
     "vpn": {
