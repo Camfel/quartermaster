@@ -1,0 +1,53 @@
+# Quartermaster VPN component — v1.0
+#
+# VPN gateway via Gluetun.  Services with network: vpn and
+# depends_on: [gluetun] route all traffic through the VPN.
+#
+# Defaults to ProtonVPN OpenVPN — works immediately after:
+#   echo -n 'user' | qm create-secret vpn-user
+#   echo -n 'pass' | qm create-secret vpn-pass
+#   qm enable vpn
+#
+# Customise via ConfigMap:
+#   qm configmap set vpn-config provider=mullvad type=wireguard
+version: "1"
+kind: Stack
+metadata:
+  name: qm-vpn
+spec:
+  services:
+    - name: gluetun
+      image: docker.io/qmcgaw/gluetun:latest
+      network: vpn
+      restart_policy: always
+      env:
+        - name: VPN_SERVICE_PROVIDER
+          value: "protonvpn"
+          valueFrom:
+            configMapRef: vpn-config
+            key: provider
+        - name: VPN_TYPE
+          value: "openvpn"
+          valueFrom:
+            configMapRef: vpn-config
+            key: type
+        - name: SERVER_REGIONS
+          valueFrom:
+            configMapRef: vpn-config
+            key: server_regions
+        - name: FIREWALL
+          value: "off"
+          valueFrom:
+            configMapRef: vpn-config
+            key: firewall
+        - name: OPENVPN_USER
+          valueFrom:
+            secretRef: vpn-user
+        - name: OPENVPN_PASSWORD
+          valueFrom:
+            secretRef: vpn-pass
+      healthcheck:
+        type: http
+        path: /v1/publicip/ip
+        port: 8000
+        interval: "30s"
