@@ -233,10 +233,18 @@ func recordReconcile(status *Status, err error) {
 }
 
 // recordContainers updates the container list from containerd state.
+// Preserves existing health-check results that may have been set by
+// runHealthChecks between reconcile passes.
 func recordContainers(status *Status, containers []cri.ContainerInfo, stack *types.Stack) {
 	svcMap := make(map[string]types.Service, len(stack.Spec.Services))
 	for _, svc := range stack.Spec.Services {
 		svcMap[svc.Name] = svc
+	}
+
+	// Snapshot current health states before rebuilding.
+	prevHealthy := make(map[string]*bool, len(status.Containers))
+	for _, c := range status.Containers {
+		prevHealthy[c.Name] = c.Healthy
 	}
 
 	out := make([]ContainerStatus, 0, len(containers))
@@ -250,6 +258,10 @@ func recordContainers(status *Status, containers []cri.ContainerInfo, stack *typ
 		if svc, ok := svcMap[c.Name]; ok {
 			cs.Network = svc.Network
 			cs.Ports = formatPorts(svc)
+		}
+		// Preserve existing health state if available.
+		if h, ok := prevHealthy[c.Name]; ok {
+			cs.Healthy = h
 		}
 		out = append(out, cs)
 	}
