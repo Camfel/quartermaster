@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sort"
 	"time"
 
 	"quartermaster/pkg/config"
@@ -390,11 +391,12 @@ func (d *Daemon) loadMergedStack() (*types.Stack, error) {
 	}
 
 	files := settings.StackFiles()
-	if len(files) <= 1 {
-		return stack, nil
-	}
+	sort.Strings(files) // deterministic order regardless of map iteration
 
-	for _, f := range files[1:] {
+	for _, f := range files {
+		if f == d.stackFile {
+			continue // already loaded as primary
+		}
 		additional, aErr := d.configManager.LoadStack(f)
 		if aErr != nil {
 			log.Printf("Warning: skipping stack %s: %v", f, aErr)
