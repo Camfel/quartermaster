@@ -357,6 +357,10 @@ func (r *Reconciler) regenerateIngress(desiredMap map[string]types.Service) {
 
 	if err := ingress.GenerateAll(entries, r.ingressDomain, r.ingressTLS); err != nil {
 		log.Printf("Warning: ingress generation failed: %v", err)
+		return
+	}
+	if err := ingress.ReloadCaddy(); err != nil {
+		log.Printf("Warning: caddy reload failed: %v", err)
 	}
 }
 
