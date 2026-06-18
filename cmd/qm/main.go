@@ -7,12 +7,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"quartermaster/pkg/config"
 	"quartermaster/pkg/secrets"
 
+	"github.com/go-git/go-git/v5"
 	"github.com/spf13/cobra"
 )
 
@@ -39,6 +41,9 @@ func main() {
 		newStatusCmd(&socketPath),
 		newSecretCmd(),
 		newServiceCmd(&socketPath),
+		newComponentsCmd(),
+		newEnableCmd(),
+		newConfigCmd(),
 	)
 
 	root.Version = version
@@ -348,4 +353,296 @@ func httpPost(socketOverride, urlPath string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 	return io.ReadAll(resp.Body)
+}
+
+// ── components ──────────────────────────────────────────────────────────
+
+func newComponentsCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "components",
+		Short: "Manage curated components (reverse proxy, VPN, monitoring)",
+	}
+	cmd.AddCommand(newComponentsListCmd())
+	return cmd
+}
+
+func newComponentsListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "list",
+		Short: "List available components and their enabled status",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			settingsPath := config.DefaultSettingsPath()
+			settings, err := config.LoadSettings(settingsPath)
+			if err != nil {
+				return fmt.Errorf("loading settings: %w", err)
+			}
+
+			if err := ensureComponentsRepo(settings, settingsPath); err != nil {
+				return err
+			}
+
+			repoDir, err := cloneOrPull(settings.ComponentsRepo)
+			if err != nil {
+				return fmt.Errorf("fetching components: %w", err)
+			}
+			defer os.RemoveAll(repoDir)
+
+			entries, err := os.ReadDir(repoDir)
+			if err != nil {
+				return fmt.Errorf("reading components repo: %w", err)
+			}
+
+			fmt.Println("Available components:")
+			for _, entry := range entries {
+				if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+					continue
+				}
+				name := entry.Name()
+				compDir := filepath.Join(repoDir, name)
+
+				verEntries, err := os.ReadDir(compDir)
+				if err != nil {
+					continue
+				}
+				var versions []string
+				for _, ve := range verEntries {
+					if ve.IsDir() {
+						sf := filepath.Join(compDir, ve.Name(), "stack.yaml")
+						if _, err := os.Stat(sf); err == nil {
+							versions = append(versions, ve.Name())
+						}
+					}
+				}
+				if len(versions) == 0 {
+					continue
+				}
+
+				comp, enabled := settings.Components[name]
+				status := "  disabled"
+				ver := ""
+				if enabled && comp.Enabled {
+					status = "✓ enabled"
+					ver = comp.Version
+				}
+				if ver == "" {
+					ver = versions[0]
+				}
+
+				fmt.Printf("  %-22s %s  (version: %s, available: %s)\n", name, status, ver, strings.Join(versions, ", "))
+			}
+			fmt.Println()
+			fmt.Println("Enable a component with: qm enable <name>")
+			return nil
+		},
+	}
+}
+
+// ── enable ──────────────────────────────────────────────────────────────
+
+func newEnableCmd() *cobra.Command {
+	var compVersion string
+
+	cmd := &cobra.Command{
+		Use:   "enable <name>",
+		Short: "Enable a curated component",
+		Long: `Enable a component from the quartermaster-components repository.
+
+The component's stack.yaml is merged with your stacks.  User services
+take precedence on name conflicts.
+
+Reload the daemon to apply:
+  sudo systemctl reload qm-daemon`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			settingsPath := config.DefaultSettingsPath()
+			settings, err := config.LoadSettings(settingsPath)
+			if err != nil {
+				return fmt.Errorf("loading settings: %w", err)
+			}
+
+			if err := ensureComponentsRepo(settings, settingsPath); err != nil {
+				return err
+			}
+
+			repoDir, err := cloneOrPull(settings.ComponentsRepo)
+			if err != nil {
+				return fmt.Errorf("fetching components: %w", err)
+			}
+			defer os.RemoveAll(repoDir)
+
+			compDir := filepath.Join(repoDir, name)
+			if info, err := os.Stat(compDir); err != nil || !info.IsDir() {
+				return fmt.Errorf("component %q not found in %s.\nRun 'qm components list' to see available components.", name, settings.ComponentsRepo)
+			}
+
+			version := compVersion
+			if version == "" {
+				verEntries, err := os.ReadDir(compDir)
+				if err != nil {
+					return fmt.Errorf("reading component %q: %w", name, err)
+				}
+				for _, ve := range verEntries {
+					if ve.IsDir() {
+						sf := filepath.Join(compDir, ve.Name(), "stack.yaml")
+						if _, err := os.Stat(sf); err == nil {
+							version = ve.Name()
+							break
+						}
+					}
+				}
+			}
+			if version == "" {
+				return fmt.Errorf("no version found for component %q", name)
+			}
+
+			if settings.Components == nil {
+				settings.Components = make(config.ComponentsConfig)
+			}
+			existing := settings.Components[name]
+			existing.Enabled = true
+			if existing.Version == "" {
+				existing.Version = version
+			}
+			settings.Components[name] = existing
+
+			if err := config.SaveSettings(settingsPath, settings); err != nil {
+				return fmt.Errorf("saving settings: %w", err)
+			}
+
+			fmt.Printf("✓ Component %q enabled (version: %s)\n", name, existing.Version)
+			fmt.Println()
+			fmt.Println("Reload the daemon to apply:")
+			fmt.Println("  sudo systemctl reload qm-daemon")
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVarP(&compVersion, "version", "v", "", "Component version (default: latest available)")
+	return cmd
+}
+
+// ── config ──────────────────────────────────────────────────────────────
+
+func newConfigCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "config",
+		Short: "View and manage daemon settings",
+	}
+	cmd.AddCommand(
+		newConfigShowCmd(),
+		newConfigSetCmd(),
+	)
+	return cmd
+}
+
+func newConfigShowCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "show",
+		Short: "Show current daemon settings",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			settingsPath := config.DefaultSettingsPath()
+			s, err := config.LoadSettings(settingsPath)
+			if err != nil {
+				return fmt.Errorf("loading settings: %w", err)
+			}
+			data, _ := json.MarshalIndent(s, "", "  ")
+			fmt.Println(string(data))
+			return nil
+		},
+	}
+}
+
+func newConfigSetCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "set <key> <value>",
+		Short: "Set a daemon setting (e.g. ingress.domain, ingress.tls)",
+		Long: `Update a top-level setting in the daemon configuration.
+
+Examples:
+  qm config set ingress.domain example.com
+  qm config set ingress.tls letsencrypt
+
+Supported keys: ingress.domain, ingress.tls, ingress.exclude_services, sync_interval`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			key, value := args[0], args[1]
+			settingsPath := config.DefaultSettingsPath()
+			s, err := config.LoadSettings(settingsPath)
+			if err != nil {
+				return fmt.Errorf("loading settings: %w", err)
+			}
+
+			switch key {
+			case "ingress.domain":
+				s.Ingress.Domain = value
+			case "ingress.tls":
+				if value != "internal" && value != "letsencrypt" {
+					return fmt.Errorf("ingress.tls must be 'internal' or 'letsencrypt'")
+				}
+				s.Ingress.TLS = value
+			case "ingress.exclude_services":
+				if value == "" || value == "[]" {
+					s.Ingress.ExcludeServices = nil
+				} else {
+					s.Ingress.ExcludeServices = strings.Split(value, ",")
+				}
+			case "sync_interval":
+				s.SyncInterval = value
+			default:
+				return fmt.Errorf("unknown setting %q. Supported: ingress.domain, ingress.tls, sync_interval", key)
+			}
+
+			if err := config.SaveSettings(settingsPath, s); err != nil {
+				return fmt.Errorf("saving settings: %w", err)
+			}
+			fmt.Printf("✓ %s = %s\n", key, value)
+			fmt.Println("Reload the daemon to apply: sudo systemctl reload qm-daemon")
+			return nil
+		},
+	}
+}
+
+// ── Git helper ──────────────────────────────────────────────────────────
+
+const defaultComponentsRepo = "https://github.com/Camfel/quartermaster-components"
+
+// ensureComponentsRepo validates and repairs the components_repo setting.
+// Auto-configures on first use; fixes stale file:// paths left by early tests.
+func ensureComponentsRepo(s *config.Settings, settingsPath string) error {
+	if s.ComponentsRepo == "" {
+		s.ComponentsRepo = defaultComponentsRepo
+		if err := config.SaveSettings(settingsPath, s); err != nil {
+			return fmt.Errorf("saving settings: %w", err)
+		}
+		return nil
+	}
+	if strings.HasPrefix(s.ComponentsRepo, "file://") || !strings.HasPrefix(s.ComponentsRepo, "http") {
+		fmt.Printf("⚠ components_repo is set to a local path (%s).\n", s.ComponentsRepo)
+		fmt.Printf("  Fixing to %s\n", defaultComponentsRepo)
+		s.ComponentsRepo = defaultComponentsRepo
+		if err := config.SaveSettings(settingsPath, s); err != nil {
+			return fmt.Errorf("saving settings: %w", err)
+		}
+	}
+	return nil
+}
+
+// cloneOrPull clones a repo to a temp dir and returns the path.
+// Uses shallow clone; caller is responsible for cleanup.
+func cloneOrPull(repoURL string) (string, error) {
+	dir, err := os.MkdirTemp("", "qm-components-")
+	if err != nil {
+		return "", fmt.Errorf("creating temp dir: %w", err)
+	}
+
+	_, err = git.PlainClone(dir, false, &git.CloneOptions{
+		URL:   repoURL,
+		Depth: 1,
+	})
+	if err != nil {
+		os.RemoveAll(dir)
+		return "", fmt.Errorf("cloning %s: %w", repoURL, err)
+	}
+	return dir, nil
 }

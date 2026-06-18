@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sort"
 	"time"
 
 	"quartermaster/pkg/config"
@@ -17,6 +18,7 @@ import (
 	"quartermaster/pkg/metrics"
 	"quartermaster/pkg/network"
 	"quartermaster/pkg/reconciler"
+	"quartermaster/pkg/types"
 )
 
 // Daemon manages the lifecycle of the Quartermaster reconciliation loop.
@@ -222,7 +224,8 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 	}
 	defer cancel()
 
-	stack, err := d.configManager.LoadStack(d.stackFile)
+	// Merge all stack files (components + repos) into a single combined stack.
+	stack, err := d.loadMergedStack()
 	if err != nil {
 		recordReconcile(d.status, err)
 		log.Printf("Failed to load stack: %v", err)
@@ -299,7 +302,7 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 // Unhealthy containers are stopped and deleted so the reconciler redeploys
 // them on the next pass.
 func (d *Daemon) runHealthChecks(ctx context.Context) {
-	stack, err := d.configManager.LoadStack(d.stackFile)
+	stack, err := d.loadMergedStack()
 	if err != nil {
 		log.Printf("Health check: failed to load stack: %v", err)
 		return
@@ -336,6 +339,15 @@ func (d *Daemon) runHealthChecks(ctx context.Context) {
 
 		result := d.healthChecker.RunCheck(svc, bridgeIP)
 
+		// Write result back to status so the GUI shows health state.
+		healthy := result.Healthy
+		for i := range d.status.Containers {
+			if d.status.Containers[i].Name == svc.Name {
+				d.status.Containers[i].Healthy = &healthy
+				break
+			}
+		}
+
 		if d.metrics != nil {
 			outcome := "pass"
 			if !result.Healthy {
@@ -364,6 +376,37 @@ func (d *Daemon) runHealthChecks(ctx context.Context) {
 	}
 }
 
+// loadMergedStack loads the primary stack and merges all additional stacks
+// from components and repos (via StackFiles).  The merged result includes
+// services from every enabled component and user repo.
+func (d *Daemon) loadMergedStack() (*types.Stack, error) {
+	stack, err := d.configManager.LoadStack(d.stackFile)
+	if err != nil {
+		return nil, err
+	}
+
+	settings, sErr := config.LoadSettings(d.settingsPath)
+	if sErr != nil {
+		return stack, nil // settings not available — use primary stack only
+	}
+
+	files := settings.StackFiles()
+	sort.Strings(files) // deterministic order regardless of map iteration
+
+	for _, f := range files {
+		if f == d.stackFile {
+			continue // already loaded as primary
+		}
+		additional, aErr := d.configManager.LoadStack(f)
+		if aErr != nil {
+			log.Printf("Warning: skipping stack %s: %v", f, aErr)
+			continue
+		}
+		stack = d.configManager.MergeStacks(stack, additional)
+	}
+	return stack, nil
+}
+
 // reload re-reads the settings file and updates the daemon's stack file path.
 func (d *Daemon) reload(ctx context.Context) error {
 	settings, err := config.LoadSettings(d.settingsPath)
@@ -375,7 +418,8 @@ func (d *Daemon) reload(ctx context.Context) error {
 	if len(files) > 0 {
 		d.stackFile = files[0]
 	}
-	log.Printf("Reloaded settings: stack file = %s", d.stackFile)
+	d.reconciler.SetIngressConfig(settings.Ingress.Domain, settings.Ingress.TLS, settings.Ingress.ExcludeServices)
+	log.Printf("Reloaded settings: stack = %s, ingress = %s/%s", d.stackFile, settings.Ingress.Domain, settings.Ingress.TLS)
 	return nil
 }
 
