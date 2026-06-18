@@ -376,19 +376,15 @@ func newComponentsListCmd() *cobra.Command {
 				return fmt.Errorf("loading settings: %w", err)
 			}
 
-			if settings.ComponentsRepo == "" {
-				fmt.Printf("components_repo is not configured in %s.\n", settingsPath)
-				fmt.Println("Enable a component to auto-configure it:")
-				fmt.Println("  qm enable vpn")
-				return nil
+			if err := ensureComponentsRepo(settings, settingsPath); err != nil {
+				return err
 			}
 
-			localBase := filepath.Join(filepath.Dir(settings.LKGPath), "components")
-			repoDir := filepath.Join(localBase, "repo")
-
-			if err := cloneOrPull(settings.ComponentsRepo, repoDir); err != nil {
+			repoDir, err := cloneOrPull(settings.ComponentsRepo)
+			if err != nil {
 				return fmt.Errorf("fetching components: %w", err)
 			}
+			defer os.RemoveAll(repoDir)
 
 			entries, err := os.ReadDir(repoDir)
 			if err != nil {
@@ -464,15 +460,15 @@ Reload the daemon to apply:
 				return fmt.Errorf("loading settings: %w", err)
 			}
 
-			if settings.ComponentsRepo == "" {
-				settings.ComponentsRepo = "https://github.com/Camfel/quartermaster-components"
+			if err := ensureComponentsRepo(settings, settingsPath); err != nil {
+				return err
 			}
 
-			localBase := filepath.Join(filepath.Dir(settings.LKGPath), "components")
-			repoDir := filepath.Join(localBase, "repo")
-			if err := cloneOrPull(settings.ComponentsRepo, repoDir); err != nil {
+			repoDir, err := cloneOrPull(settings.ComponentsRepo)
+			if err != nil {
 				return fmt.Errorf("fetching components: %w", err)
 			}
+			defer os.RemoveAll(repoDir)
 
 			compDir := filepath.Join(repoDir, name)
 			if info, err := os.Stat(compDir); err != nil || !info.IsDir() {
@@ -527,37 +523,44 @@ Reload the daemon to apply:
 
 // ── Git helper ──────────────────────────────────────────────────────────
 
-// cloneOrPull ensures the repo exists at dir, cloning if absent or pulling if present.
-func cloneOrPull(repoURL, dir string) error {
-	if info, err := os.Stat(filepath.Join(dir, ".git")); err == nil && info.IsDir() {
-		repo, err := git.PlainOpen(dir)
-		if err != nil {
-			return fmt.Errorf("opening repo at %s: %w", dir, err)
+const defaultComponentsRepo = "https://github.com/Camfel/quartermaster-components"
+
+// ensureComponentsRepo validates and repairs the components_repo setting.
+// Auto-configures on first use; fixes stale file:// paths left by early tests.
+func ensureComponentsRepo(s *config.Settings, settingsPath string) error {
+	if s.ComponentsRepo == "" {
+		s.ComponentsRepo = defaultComponentsRepo
+		if err := config.SaveSettings(settingsPath, s); err != nil {
+			return fmt.Errorf("saving settings: %w", err)
 		}
-		wt, err := repo.Worktree()
-		if err != nil {
-			return fmt.Errorf("worktree: %w", err)
-		}
-		if err := wt.Pull(&git.PullOptions{
-			RemoteName: "origin",
-		}); err != nil && err != git.NoErrAlreadyUpToDate {
-			os.RemoveAll(dir)
-		} else {
-			return nil
+		return nil
+	}
+	if strings.HasPrefix(s.ComponentsRepo, "file://") || !strings.HasPrefix(s.ComponentsRepo, "http") {
+		fmt.Printf("⚠ components_repo is set to a local path (%s).\n", s.ComponentsRepo)
+		fmt.Printf("  Fixing to %s\n", defaultComponentsRepo)
+		s.ComponentsRepo = defaultComponentsRepo
+		if err := config.SaveSettings(settingsPath, s); err != nil {
+			return fmt.Errorf("saving settings: %w", err)
 		}
 	}
+	return nil
+}
 
-	if err := os.MkdirAll(filepath.Dir(dir), 0755); err != nil {
-		return err
+// cloneOrPull clones a repo to a temp dir and returns the path.
+// Uses shallow clone; caller is responsible for cleanup.
+func cloneOrPull(repoURL string) (string, error) {
+	dir, err := os.MkdirTemp("", "qm-components-")
+	if err != nil {
+		return "", fmt.Errorf("creating temp dir: %w", err)
 	}
-	os.RemoveAll(dir)
 
-	_, err := git.PlainClone(dir, false, &git.CloneOptions{
+	_, err = git.PlainClone(dir, false, &git.CloneOptions{
 		URL:   repoURL,
 		Depth: 1,
 	})
 	if err != nil {
-		return fmt.Errorf("cloning %s: %w", repoURL, err)
+		os.RemoveAll(dir)
+		return "", fmt.Errorf("cloning %s: %w", repoURL, err)
 	}
-	return nil
+	return dir, nil
 }
