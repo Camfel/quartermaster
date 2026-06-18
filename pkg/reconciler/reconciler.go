@@ -327,6 +327,14 @@ func (r *Reconciler) regenerateIngress(desiredMap map[string]types.Service) {
 		if r.netMgr != nil {
 			ip = r.netMgr.LookupIP(svc.Name)
 		}
+		// Public and host-networked services share the host namespace.
+		// Use localhost so Caddy can reach them on the host port.
+		if ip == nil && (svc.Network == "public" || svc.Network == "host") {
+			ip = net.ParseIP("127.0.0.1")
+		}
+		if ip == nil {
+			continue // no routeable address
+		}
 		entries = append(entries, ingress.ServiceEntry{
 			Name:    svc.Name,
 			IP:      ip,
