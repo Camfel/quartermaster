@@ -26,8 +26,8 @@ type Reconciler struct {
 	configManager   *config.ConfigManager
 	netMgr          network.NetManager
 
-	ingressDomain string
-	ingressTLS    string
+	ingressDomain  string
+	ingressTLS     string
 	ingressExclude map[string]bool
 
 	// serviceProfiles tracks the network profile of each created service

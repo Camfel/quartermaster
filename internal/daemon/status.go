@@ -51,7 +51,7 @@ type ContainerStatus struct {
 
 // ── HTTP server ──────────────────────────────────────────────────────────
 
-const apiVersion = "0.5.0"
+var apiVersion = "dev"
 
 // logFn maps a service name to its log output.
 type logFn func(ctx context.Context, serviceName string, tail string) (string, error)
@@ -211,14 +211,14 @@ func startAPI(socketPath string, status *Status, reloadCh chan struct{}, reconci
 					Network       string               `json:"network,omitempty"`
 					User          string               `json:"user,omitempty"`
 					DependsOn     []string             `json:"depends_on,omitempty"`
-					HealthCheck   *types.HealthCheck    `json:"healthcheck,omitempty"`
-					Resources     *types.Resources      `json:"resources,omitempty"`
+					HealthCheck   *types.HealthCheck   `json:"healthcheck,omitempty"`
+					Resources     *types.Resources     `json:"resources,omitempty"`
 					Command       []string             `json:"command,omitempty"`
-					Ingress       *types.IngressConfig  `json:"ingress,omitempty"`
+					Ingress       *types.IngressConfig `json:"ingress,omitempty"`
 					// Runtime fields (from container snapshot).
-					Running       bool                 `json:"running"`
-					PID           uint32               `json:"pid,omitempty"`
-					Healthy       *bool                `json:"healthy,omitempty"`
+					Running bool   `json:"running"`
+					PID     uint32 `json:"pid,omitempty"`
+					Healthy *bool  `json:"healthy,omitempty"`
 				}{
 					Name:          svc.Name,
 					Image:         svc.Image,
