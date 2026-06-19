@@ -19,10 +19,11 @@ import (
 )
 
 const (
-	version              = "0.5.0"
 	defaultSecretsDir    = "/etc/quartermaster/secrets"
 	defaultMasterKeyPath = "/etc/quartermaster/master.key"
 )
+
+var version = "dev"
 
 func main() {
 	var socketPath string

@@ -18,6 +18,10 @@ SYSTEMD_DIR  ?= /etc/systemd/system
 QM_USER      ?= quartermaster
 CONTAINERD_SOCK ?= /run/containerd/containerd.sock
 
+# ── Version ────────────────────────────────────────────────────────────
+VERSION ?= $(shell cat VERSION)
+LDFLAGS ?= -X quartermaster/internal/daemon.apiVersion=$(VERSION) -X main.version=$(VERSION)
+
 # ── Development pipeline ─────────────────────────────────────────────────
 
 # Default: full CI gate.
@@ -44,15 +48,15 @@ test-race:
 # Optimised debug build (keeps symbol tables for profiling).
 build:
 	@mkdir -p $(BIN_DIR)
-	go build -trimpath -o $(QM_BIN) ./cmd/qm
-	go build -trimpath -o $(DAEMON_BIN) ./cmd/qm-daemon
+	go build -trimpath -ldflags="$(LDFLAGS)" -o $(QM_BIN) ./cmd/qm
+	go build -trimpath -ldflags="$(LDFLAGS)" -o $(DAEMON_BIN) ./cmd/qm-daemon
 	@echo "✓ Binaries: $(QM_BIN)  $(DAEMON_BIN)"
 
 # Stripped production build.
 release:
 	@mkdir -p $(BIN_DIR)
-	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $(QM_BIN) ./cmd/qm
-	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $(DAEMON_BIN) ./cmd/qm-daemon
+	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w $(LDFLAGS)" -o $(QM_BIN) ./cmd/qm
+	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w $(LDFLAGS)" -o $(DAEMON_BIN) ./cmd/qm-daemon
 	@echo "✓ Release binaries: $(QM_BIN)  $(DAEMON_BIN)"
 
 # Build + restart the running systemd daemon (dev loop).
