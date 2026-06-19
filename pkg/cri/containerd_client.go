@@ -177,7 +177,8 @@ type ContainerdClient struct {
 	netMgr    network.NetManager // network: bridge, IPAM, port forwarding, VPN routing
 	hwDetect  *hardware.Detector // optional: for GPU device injection
 
-	logs *logStore
+	logs   *logStore
+	logDir string // directory for per-container log files
 
 	// mountCleanups tracks tmp directories created for secret mounts.
 	// Keyed by container ID, called on DeleteContainer.
@@ -215,6 +216,14 @@ func (c *ContainerdClient) WithNetManager(nm network.NetManager) *ContainerdClie
 // WithHardwareDetector sets the hardware detector for GPU device injection.
 func (c *ContainerdClient) WithHardwareDetector(hd *hardware.Detector) *ContainerdClient {
 	c.hwDetect = hd
+	return c
+}
+
+// WithLogDir sets the directory for persistent container log files.
+// Logs are written to <logDir>/<containerID>.log in addition to the
+// in-memory ring buffer, so logs survive daemon restarts.
+func (c *ContainerdClient) WithLogDir(dir string) *ContainerdClient {
+	c.logDir = dir
 	return c
 }
 
@@ -492,6 +501,21 @@ func (c *ContainerdClient) StartContainer(ctx context.Context, containerID strin
 	rb := c.logs.get(containerID)
 	var logWriter io.Writer = rb
 
+	// Also persist logs to a file so they survive daemon restarts.
+	if c.logDir != "" {
+		if err := os.MkdirAll(c.logDir, 0755); err != nil {
+			log.Printf("Warning: cannot create log dir %s: %v", c.logDir, err)
+		} else {
+			logPath := filepath.Join(c.logDir, containerID+".log")
+			lf, lfErr := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+			if lfErr != nil {
+				log.Printf("Warning: cannot open log file %s: %v", logPath, lfErr)
+			} else {
+				logWriter = io.MultiWriter(rb, lf)
+			}
+		}
+	}
+
 	task, err := container.NewTask(ctx, cio.NewCreator(cio.WithStreams(
 		nil,
 		logWriter,
@@ -550,6 +574,22 @@ func (c *ContainerdClient) ContainerLogs(ctx context.Context, containerID string
 			return buf, nil
 		}
 		return rb.TailBytes(n), nil
+	}
+
+	// Fall back to log file if ring buffer is empty (container was started
+	// before log capture was enabled or daemon was restarted).
+	if c.logDir != "" {
+		logPath := filepath.Join(c.logDir, containerID+".log")
+		if data, fileErr := os.ReadFile(logPath); fileErr == nil && len(data) > 0 {
+			content := string(data)
+			if tail == "all" || tail == "" {
+				return content, nil
+			}
+			if n < len(content) {
+				return content[len(content)-n:], nil
+			}
+			return content, nil
+		}
 	}
 
 	return "(container was started before log capture was enabled — logs will appear after next restart)", nil

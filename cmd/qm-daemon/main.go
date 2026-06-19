@@ -75,7 +75,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialize bridge manager: %v", err)
 	}
-	cc.WithSecrets(secretMgr).WithNetManager(netMgr).WithHardwareDetector(hardware.NewDetector())
+	cc.WithSecrets(secretMgr).WithNetManager(netMgr).WithHardwareDetector(hardware.NewDetector()).WithLogDir("/var/log/quartermaster")
 
 	// Set up the qm0 bridge for non-host-networked containers.
 	if err := netMgr.Setup(); err != nil {
