@@ -30,6 +30,9 @@ type Status struct {
 
 	Containers []ContainerStatus `json:"containers"`
 
+	// currentStack holds the most recent merged stack for service detail lookups.
+	currentStack *types.Stack
+
 	LKGHealthy bool   `json:"lkg_healthy"`
 	LKGError   string `json:"lkg_error,omitempty"`
 }
@@ -57,8 +60,12 @@ type logFn func(ctx context.Context, serviceName string, tail string) (string, e
 // reconciler will redeploy it.
 type restartFn func(ctx context.Context, serviceName string) error
 
+// serviceSpecFn returns the full Service spec from the current stack for a
+// given service name, or nil if not found.
+type serviceSpecFn func(name string) *types.Service
+
 // startAPI listens on a Unix socket and serves the status API.
-func startAPI(socketPath string, status *Status, reloadCh chan struct{}, reconcileCh chan struct{}, logsFn logFn, restartFn restartFn, metricsHandler http.Handler) error {
+func startAPI(socketPath string, status *Status, reloadCh chan struct{}, reconcileCh chan struct{}, logsFn logFn, restartFn restartFn, serviceSpecFn serviceSpecFn, metricsHandler http.Handler) error {
 	if err := os.MkdirAll(socketPath, 0755); err != nil {
 		return err
 	}
@@ -189,7 +196,65 @@ func startAPI(socketPath string, status *Status, reloadCh chan struct{}, reconci
 			return
 		}
 
-		// ── Service config from status ─────────────────────────────
+		// ── Service detail: merge manifest spec with runtime status ─
+		if serviceSpecFn != nil {
+			if svc := serviceSpecFn(name); svc != nil {
+				// Build response with full service manifest + runtime info.
+				resp := struct {
+					Name          string               `json:"name"`
+					Image         string               `json:"image"`
+					RestartPolicy string               `json:"restart_policy"`
+					Ports         []types.Port         `json:"ports,omitempty"`
+					Volumes       []types.Volume       `json:"volumes,omitempty"`
+					Env           []types.EnvVar       `json:"env,omitempty"`
+					Secrets       []types.SecretRef    `json:"secrets,omitempty"`
+					Network       string               `json:"network,omitempty"`
+					User          string               `json:"user,omitempty"`
+					DependsOn     []string             `json:"depends_on,omitempty"`
+					HealthCheck   *types.HealthCheck    `json:"healthcheck,omitempty"`
+					Resources     *types.Resources      `json:"resources,omitempty"`
+					Command       []string             `json:"command,omitempty"`
+					Ingress       *types.IngressConfig  `json:"ingress,omitempty"`
+					// Runtime fields (from container snapshot).
+					Running       bool                 `json:"running"`
+					PID           uint32               `json:"pid,omitempty"`
+					Healthy       *bool                `json:"healthy,omitempty"`
+				}{
+					Name:          svc.Name,
+					Image:         svc.Image,
+					RestartPolicy: svc.RestartPolicy,
+					Ports:         svc.Ports,
+					Volumes:       svc.Volumes,
+					Env:           svc.Env,
+					Secrets:       svc.Secrets,
+					Network:       svc.Network,
+					User:          svc.User,
+					DependsOn:     svc.DependsOn,
+					Command:       svc.Command,
+					Ingress:       svc.Ingress,
+				}
+				if svc.HealthCheck != nil {
+					resp.HealthCheck = svc.HealthCheck
+				}
+				if svc.Resources != nil {
+					resp.Resources = svc.Resources
+				}
+				// Merge runtime status from container snapshot.
+				for _, c := range status.Containers {
+					if c.Name == name {
+						resp.Running = c.Running
+						resp.PID = c.PID
+						resp.Healthy = c.Healthy
+						break
+					}
+				}
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(resp)
+				return
+			}
+		}
+
+		// ── Fallback: return container snapshot if no spec lookup ──
 		for _, c := range status.Containers {
 			if c.Name == name {
 				w.Header().Set("Content-Type", "application/json")
@@ -236,6 +301,7 @@ func recordReconcile(status *Status, err error) {
 // Preserves existing health-check results that may have been set by
 // runHealthChecks between reconcile passes.
 func recordContainers(status *Status, containers []cri.ContainerInfo, stack *types.Stack) {
+	status.currentStack = stack
 	svcMap := make(map[string]types.Service, len(stack.Spec.Services))
 	for _, svc := range stack.Spec.Services {
 		svcMap[svc.Name] = svc
