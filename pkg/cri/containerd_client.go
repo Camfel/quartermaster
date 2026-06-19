@@ -3,6 +3,8 @@ package cri
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -448,10 +450,14 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 		labels["quartermaster.gateway-ip"] = gatewayIP
 	}
 
+	// Use a short random suffix to prevent "task already exists" collisions
+	// when a container is deleted and recreated before containerd cleans up.
+	containerName := svc.Name + "-" + randomSuffix(6)
+
 	container, err := c.client.NewContainer(
 		ctx,
-		svc.Name,
-		containerd.WithNewSnapshot(svc.Name+"-snapshot", image),
+		containerName,
+		containerd.WithNewSnapshot(containerName+"-snapshot", image),
 		containerd.WithNewSpec(specOpts...),
 		containerd.WithContainerLabels(labels),
 	)
@@ -522,7 +528,28 @@ func (c *ContainerdClient) StartContainer(ctx context.Context, containerID strin
 		logWriter,
 	)))
 	if err != nil {
-		return fmt.Errorf("failed to create task for container %s: %w", containerID, err)
+		// If a stale task from a previous run still exists, clean it up and retry.
+		if strings.Contains(err.Error(), "already exists") {
+			log.Printf("Stale task for %s, cleaning up...", containerID)
+			if existingTask, loadErr := container.Task(ctx, nil); loadErr == nil {
+				// Force-kill and delete the stale task.
+				if _, delErr := existingTask.Delete(ctx, containerd.WithProcessKill); delErr != nil {
+					log.Printf("Warning: stale task delete for %s failed: %v", containerID, delErr)
+				}
+			}
+			// Retry once.
+			time.Sleep(1 * time.Second)
+			task, err = container.NewTask(ctx, cio.NewCreator(cio.WithStreams(
+				nil,
+				logWriter,
+				logWriter,
+			)))
+			if err != nil {
+				return fmt.Errorf("failed to create task for container %s (after cleanup): %w", containerID, err)
+			}
+		} else {
+			return fmt.Errorf("failed to create task for container %s: %w", containerID, err)
+		}
 	}
 
 	if err := task.Start(ctx); err != nil {
@@ -854,4 +881,13 @@ func parseSize(s string) (int64, error) {
 		return 0, fmt.Errorf("invalid size: %q", s)
 	}
 	return n * multiplier, nil
+}
+
+// randomSuffix returns a short hex string from crypto/rand for unique container names.
+func randomSuffix(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano()%100000)
+	}
+	return hex.EncodeToString(b)[:n]
 }

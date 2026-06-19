@@ -160,7 +160,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 					log.Printf("Warning: stop failed for %s: %v", serviceName, err)
 				}
 				if err := d.containerClient.DeleteContainer(ctx, c.ID); err != nil {
-					return fmt.Errorf("delete failed for %s: %w", serviceName, err)
+					log.Printf("Warning: delete failed for %s: %v (will still trigger reconcile)", serviceName, err)
 				}
 				d.TriggerReconcile()
 				return nil
