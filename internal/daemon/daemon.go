@@ -169,11 +169,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return fmt.Errorf("container for service %q not found", serviceName)
 	}
 
+	serviceLookup := func(name string) *types.Service {
+		if d.status.currentStack == nil {
+			return nil
+		}
+		for i := range d.status.currentStack.Spec.Services {
+			if d.status.currentStack.Spec.Services[i].Name == name {
+				return &d.status.currentStack.Spec.Services[i]
+			}
+		}
+		return nil
+	}
+
 	var mh http.Handler
 	if d.metrics != nil {
 		mh = d.metrics.Handler()
 	}
-	if err := startAPI(d.socketPath, d.status, d.reloadCh, d.reconcileChan, logLookup, restartService, mh); err != nil {
+	if err := startAPI(d.socketPath, d.status, d.reloadCh, d.reconcileChan, logLookup, restartService, serviceLookup, mh); err != nil {
 		log.Printf("Warning: status API failed to start: %v", err)
 	}
 
