@@ -164,7 +164,7 @@ func startAPI(socketPath string, status *Status, reloadCh chan struct{}, reconci
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]string{"ok": "true", "message": "restarting " + name})
+			json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "message": "restarting " + name})
 			return
 		}
 
