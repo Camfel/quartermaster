@@ -1,5 +1,9 @@
 # Quartermaster
 
+<p align="center">
+  <img src="docs/banner.png" alt="Quartermaster" width="800">
+</p>
+
 Lightweight, single-node container orchestrator for homelabs.
 
 Quartermaster reconciles a YAML manifest against a [containerd](https://containerd.io)
