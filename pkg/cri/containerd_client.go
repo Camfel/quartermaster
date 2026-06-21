@@ -234,11 +234,17 @@ func (c *ContainerdClient) withNamespace(ctx context.Context) context.Context {
 	return namespaces.WithNamespace(ctx, c.namespace)
 }
 
-// PullImage pulls an image from the registry.
+// PullImage pulls an image from the registry.  If the image is already
+// present locally, the pull is skipped and the local image is returned.
 func (c *ContainerdClient) PullImage(ctx context.Context, ref string) (string, error) {
 	ctx = c.withNamespace(ctx)
 
 	fullRef := qualifyImageRef(ref)
+
+	// Check if already present locally — skip the registry round-trip.
+	if localImage, localErr := c.client.GetImage(ctx, fullRef); localErr == nil {
+		return localImage.Name(), nil
+	}
 
 	log.Printf("Pulling image: %s", fullRef)
 
