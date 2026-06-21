@@ -405,33 +405,6 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 			}
 		}
 
-		// Bind-mount the single shared resolv.conf so the container has
-		// working DNS via the bridge gateway's in-process forwarder.
-		if preparedNs != "" {
-			resolvPath := "/var/lib/quartermaster/resolv.conf"
-			specOpts = append(specOpts, oci.WithMounts([]specs.Mount{
-				{
-					Type:        "bind",
-					Source:      resolvPath,
-					Destination: "/etc/resolv.conf",
-					Options:     []string{"bind", "ro"},
-				},
-			}))
-
-			// Mount generated hosts file for inter-container name resolution.
-			hostsPath := "/var/lib/quartermaster/caddy/hosts"
-			if _, err := os.Stat(hostsPath); err == nil {
-				specOpts = append(specOpts, oci.WithMounts([]specs.Mount{
-					{
-						Type:        "bind",
-						Source:      hostsPath,
-						Destination: "/etc/hosts",
-						Options:     []string{"bind", "ro"},
-					},
-				}))
-			}
-		}
-
 		// Port forwarding via DNAT.
 		if len(svc.Ports) > 0 && netInfo.IP != nil {
 			c.netMgr.ExposePorts(svc.Name, netInfo.IP, svc.Ports)
@@ -440,6 +413,32 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 
 	if preparedNs != "" {
 		specOpts = append(specOpts, withNetworkNamespace(preparedNs))
+	}
+
+	// Bind-mount the shared resolv.conf for ALL containers so they resolve
+	// bridge hostnames via the in-process DNS forwarder.  This fixes DNS for
+	// host-networked containers which otherwise use the LAN router's DNS.
+	resolvPath := "/var/lib/quartermaster/resolv.conf"
+	specOpts = append(specOpts, oci.WithMounts([]specs.Mount{
+		{
+			Type:        "bind",
+			Source:      resolvPath,
+			Destination: "/etc/resolv.conf",
+			Options:     []string{"bind", "ro"},
+		},
+	}))
+
+	// Mount generated hosts file for inter-container name resolution.
+	hostsPath := "/var/lib/quartermaster/caddy/hosts"
+	if _, err := os.Stat(hostsPath); err == nil {
+		specOpts = append(specOpts, oci.WithMounts([]specs.Mount{
+			{
+				Type:        "bind",
+				Source:      hostsPath,
+				Destination: "/etc/hosts",
+				Options:     []string{"bind", "ro"},
+			},
+		}))
 	}
 
 	labels := map[string]string{
