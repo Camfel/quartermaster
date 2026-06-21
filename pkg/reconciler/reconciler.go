@@ -173,6 +173,14 @@ func (r *Reconciler) ReconcileStack(ctx context.Context, stack *types.Stack) err
 				}
 			} else {
 				log.Printf("Service %s is already running (no changes detected).", svc.Name)
+				// Re-apply DNAT rules in case they were lost (e.g. firewall
+				// flush, daemon restart, or stale clean-up race).
+				if r.netMgr != nil && len(svc.Ports) > 0 {
+					ipStr := runningBridgeIPs[svc.Name]
+					if ipStr != "" {
+						r.netMgr.ExposePorts(svc.Name, net.ParseIP(ipStr), svc.Ports)
+					}
+				}
 			}
 		}
 	}
