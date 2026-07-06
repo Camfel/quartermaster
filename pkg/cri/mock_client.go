@@ -44,7 +44,7 @@ func NewMockContainerClient() *MockContainerClient {
 }
 
 // PullImage implements the ContainerClient interface.
-func (m *MockContainerClient) PullImage(ctx context.Context, ref string) (string, error) {
+func (m *MockContainerClient) PullImage(ctx context.Context, ref string, auth *types.RegistryAuth) (string, error) {
 	if m.OnPullImage != nil {
 		return m.OnPullImage(ref)
 	}
@@ -178,4 +178,10 @@ func (m *MockContainerClient) ContainerStats(ctx context.Context, containerID st
 		MemoryUsageBytes: 128 * 1024 * 1024,
 		MemoryLimitBytes: 256 * 1024 * 1024,
 	}, nil
+}
+
+// CheckImageUpdate implements the ContainerClient interface.
+// Returns false (no update) by default; set OnCheckImageUpdate to override.
+func (m *MockContainerClient) CheckImageUpdate(ctx context.Context, ref string, auth *types.RegistryAuth) (bool, string, error) {
+	return false, "", nil
 }

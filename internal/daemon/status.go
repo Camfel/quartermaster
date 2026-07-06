@@ -215,6 +215,9 @@ func startAPI(socketPath string, status *Status, reloadCh chan struct{}, reconci
 					Resources     *types.Resources     `json:"resources,omitempty"`
 					Command       []string             `json:"command,omitempty"`
 					Ingress       *types.IngressConfig `json:"ingress,omitempty"`
+					RegistryAuth  *types.RegistryAuth  `json:"registry_auth,omitempty"`
+					RestartAt     *types.RestartAt     `json:"restart_at,omitempty"`
+					RollingUpdate bool                 `json:"rolling_update,omitempty"`
 					// Runtime fields (from container snapshot).
 					Running bool   `json:"running"`
 					PID     uint32 `json:"pid,omitempty"`
@@ -232,6 +235,9 @@ func startAPI(socketPath string, status *Status, reloadCh chan struct{}, reconci
 					DependsOn:     svc.DependsOn,
 					Command:       svc.Command,
 					Ingress:       svc.Ingress,
+					RegistryAuth:  svc.RegistryAuth,
+					RestartAt:     svc.RestartAt,
+					RollingUpdate: svc.RollingUpdate,
 				}
 				if svc.HealthCheck != nil {
 					resp.HealthCheck = svc.HealthCheck

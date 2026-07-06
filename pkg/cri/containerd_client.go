@@ -5,9 +5,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -28,6 +30,8 @@ import (
 	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/remotes"
+	"github.com/containerd/containerd/remotes/docker"
 	gogoproto "github.com/gogo/protobuf/proto"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -236,7 +240,8 @@ func (c *ContainerdClient) withNamespace(ctx context.Context) context.Context {
 
 // PullImage pulls an image from the registry.  If the image is already
 // present locally, the pull is skipped and the local image is returned.
-func (c *ContainerdClient) PullImage(ctx context.Context, ref string) (string, error) {
+// auth provides optional credentials for private registries.
+func (c *ContainerdClient) PullImage(ctx context.Context, ref string, auth *types.RegistryAuth) (string, error) {
 	ctx = c.withNamespace(ctx)
 
 	fullRef := qualifyImageRef(ref)
@@ -248,12 +253,114 @@ func (c *ContainerdClient) PullImage(ctx context.Context, ref string) (string, e
 
 	log.Printf("Pulling image: %s", fullRef)
 
-	image, err := c.client.Pull(ctx, fullRef, containerd.WithPullUnpack)
+	pullOpts := []containerd.RemoteOpt{containerd.WithPullUnpack}
+	if auth != nil {
+		resolver, rErr := c.authenticatedResolver(ctx, auth)
+		if rErr != nil {
+			return "", fmt.Errorf("registry auth for %s: %w", fullRef, rErr)
+		}
+		pullOpts = append(pullOpts, containerd.WithResolver(resolver))
+	}
+
+	image, err := c.client.Pull(ctx, fullRef, pullOpts...)
 	if err != nil {
 		return "", fmt.Errorf("failed to pull image %s: %w", fullRef, err)
 	}
 
 	return image.Name(), nil
+}
+
+// CheckImageUpdate compares the local image digest with the remote registry
+// manifest digest.  Returns (true, newDigest, nil) when a newer version is
+// available, (false, "", nil) when up-to-date, or (false, "", error) on failure.
+// auth provides optional credentials for private registries.
+func (c *ContainerdClient) CheckImageUpdate(ctx context.Context, ref string, auth *types.RegistryAuth) (bool, string, error) {
+	ctx = c.withNamespace(ctx)
+	fullRef := qualifyImageRef(ref)
+
+	// ── Resolve local digest ─────────────────────────────────────────
+	var localDigest string
+	if img, err := c.client.GetImage(ctx, fullRef); err == nil {
+		localDigest = img.Target().Digest.String()
+	}
+	// If the image isn't present locally, there's definitely an "update".
+
+	// ── Build resolver (authenticated if registry_auth is set) ───────
+	var resolver remotes.Resolver
+	if auth != nil {
+		authResolver, rErr := c.authenticatedResolver(ctx, auth)
+		if rErr != nil {
+			return false, "", fmt.Errorf("registry auth for %s: %w", fullRef, rErr)
+		}
+		resolver = authResolver
+	} else {
+		resolver = docker.NewResolver(docker.ResolverOptions{
+			Client: http.DefaultClient,
+		})
+	}
+
+	// Resolve returns the name and descriptor (with digest) from the registry.
+	_, desc, err := resolver.Resolve(ctx, fullRef)
+	if err != nil {
+		return false, "", fmt.Errorf("failed to resolve remote image %s: %w", fullRef, err)
+	}
+	remoteDigest := desc.Digest.String()
+
+	if localDigest == "" {
+		return true, remoteDigest, nil
+	}
+
+	if localDigest != remoteDigest {
+		log.Printf("Image %s has an update: local=%s remote=%s", fullRef,
+			localDigest[:19], remoteDigest[:19])
+		return true, remoteDigest, nil
+	}
+
+	return false, "", nil
+}
+
+// registryCreds is the on-disk format for a registry-credentials secret.
+type registryCreds struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// authenticatedResolver creates a containerd Docker resolver that
+// authenticates with username/password read from the referenced qm secret.
+func (c *ContainerdClient) authenticatedResolver(ctx context.Context, auth *types.RegistryAuth) (remotes.Resolver, error) {
+	if auth == nil || auth.SecretRef == "" || c.secrets == nil {
+		return nil, fmt.Errorf("no registry auth configured")
+	}
+
+	secretData, err := c.secrets.Resolve(auth.SecretRef, auth.SecretRef)
+	if err != nil {
+		return nil, fmt.Errorf("read secret %q: %w", auth.SecretRef, err)
+	}
+
+	var creds registryCreds
+	if err := json.Unmarshal(secretData.Content, &creds); err != nil {
+		return nil, fmt.Errorf("secret %q must be JSON with username and password keys: %w", auth.SecretRef, err)
+	}
+	if creds.Username == "" || creds.Password == "" {
+		return nil, fmt.Errorf("secret %q: username and password are required", auth.SecretRef)
+	}
+
+	// Build an OAuth/Docker token authorizer with basic-auth fallback.
+	authorizer := docker.NewDockerAuthorizer(
+		docker.WithAuthClient(http.DefaultClient),
+		docker.WithAuthCreds(func(host string) (string, string, error) {
+			return creds.Username, creds.Password, nil
+		}),
+	)
+
+	resolver := docker.NewResolver(docker.ResolverOptions{
+		Hosts: docker.ConfigureDefaultRegistries(
+			docker.WithClient(http.DefaultClient),
+			docker.WithAuthorizer(authorizer),
+		),
+	})
+
+	return resolver, nil
 }
 
 // qualifyImageRef adds docker.io/ prefix and :latest tag if missing.

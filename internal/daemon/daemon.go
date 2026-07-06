@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"sort"
+	"sync"
 	"time"
 
 	"quartermaster/pkg/config"
@@ -46,6 +47,12 @@ type Daemon struct {
 
 	reconcileChan chan struct{}
 	reloadCh      chan struct{}
+
+	// lastScheduledRestart tracks when each service was last restarted by
+	// the schedule ticker, keyed by service name.  The mu protects
+	// concurrent access from the schedule ticker and status reads.
+	lastScheduledRestart   map[string]time.Time
+	lastScheduledRestartMu sync.Mutex
 }
 
 // NewDaemon initializes a new Daemon instance.
@@ -66,23 +73,24 @@ func NewDaemon(
 	gitChangeCh <-chan struct{},
 ) *Daemon {
 	return &Daemon{
-		reconciler:      r,
-		containerClient: cc,
-		configManager:   cm,
-		netMgr:          nm,
-		stackFile:       stackFile,
-		socketPath:      socketPath,
-		settingsPath:    settingsPath,
-		lkgPath:         lkgPath,
-		syncInterval:    syncInterval,
-		maxFailures:     maxFailures,
-		healthChecker:   health.NewChecker(),
-		watchers:        watchers,
-		metrics:         m,
-		metricsAddr:     metricsAddr,
-		gitChangeCh:     gitChangeCh,
-		reconcileChan:   make(chan struct{}, 1),
-		reloadCh:        make(chan struct{}, 1),
+		reconciler:           r,
+		containerClient:      cc,
+		configManager:        cm,
+		netMgr:               nm,
+		stackFile:            stackFile,
+		socketPath:           socketPath,
+		settingsPath:         settingsPath,
+		lkgPath:              lkgPath,
+		syncInterval:         syncInterval,
+		maxFailures:          maxFailures,
+		healthChecker:        health.NewChecker(),
+		watchers:             watchers,
+		metrics:              m,
+		metricsAddr:          metricsAddr,
+		gitChangeCh:          gitChangeCh,
+		reconcileChan:        make(chan struct{}, 1),
+		reloadCh:             make(chan struct{}, 1),
+		lastScheduledRestart: make(map[string]time.Time),
 		status: &Status{
 			Version:    apiVersion,
 			StartedAt:  time.Now(),
@@ -99,7 +107,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	healthTicker := time.NewTicker(30 * time.Second)
 	defer healthTicker.Stop()
 
-	log.Printf("Daemon loop started. Sync interval: %v, Health interval: 30s", d.syncInterval)
+	scheduleTicker := time.NewTicker(60 * time.Second)
+	defer scheduleTicker.Stop()
+
+	log.Printf("Daemon loop started. Sync interval: %v, Health interval: 30s, Schedule check: 60s", d.syncInterval)
 
 	// ── Start git watchers ─────────────────────────────────────────
 	for _, w := range d.watchers {
@@ -220,6 +231,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 		case <-d.gitChangeCh:
 			log.Println("Git change detected — triggering reconcile")
 			d.TriggerReconcile()
+		case <-scheduleTicker.C:
+			d.runScheduledRestarts(ctx)
 		}
 	}
 }
@@ -385,6 +398,112 @@ func (d *Daemon) runHealthChecks(ctx context.Context) {
 		d.TriggerReconcile()
 		// Only restart one unhealthy service per tick to avoid cascades.
 		break
+	}
+}
+
+// runScheduledRestarts checks every service with a restart_at schedule and
+// triggers a restart if the current local time falls within the restart
+// window and the service hasn't been restarted recently (debounce: 5 min).
+func (d *Daemon) runScheduledRestarts(ctx context.Context) {
+	stack, err := d.loadMergedStack()
+	if err != nil {
+		return
+	}
+
+	containers, err := d.containerClient.ListContainers(ctx)
+	if err != nil {
+		return
+	}
+	idByName := make(map[string]string, len(containers))
+	for _, c := range containers {
+		idByName[c.Name] = c.ID
+	}
+
+	now := time.Now().Local()
+	currentTime := fmt.Sprintf("%02d:%02d", now.Hour(), now.Minute())
+	currentDate := now.Format("2006-01-02")
+
+	for _, svc := range stack.Spec.Services {
+		if svc.RestartAt == nil || svc.RestartAt.Time == "" {
+			continue
+		}
+
+		// Only "daily" frequency is supported in this version.
+		if svc.RestartAt.Frequency != "" && svc.RestartAt.Frequency != "daily" {
+			continue
+		}
+
+		if currentTime != svc.RestartAt.Time {
+			continue
+		}
+
+		// Debounce: don't restart again within 5 minutes of the last one.
+		d.lastScheduledRestartMu.Lock()
+		lastRestart, existed := d.lastScheduledRestart[svc.Name]
+		d.lastScheduledRestartMu.Unlock()
+
+		// Use a composite key (name+date) so daily restarts don't get
+		// suppressed by yesterday's restart.
+		restartKey := svc.Name + "@" + currentDate
+		d.lastScheduledRestartMu.Lock()
+		if _, dateExisted := d.lastScheduledRestart[restartKey]; dateExisted {
+			d.lastScheduledRestartMu.Unlock()
+			continue // already restarted today
+		}
+		d.lastScheduledRestartMu.Unlock()
+
+		if existed && now.Sub(lastRestart) < 5*time.Minute {
+			continue
+		}
+
+		// If the container isn't running, skip — reconcile will create it.
+		oldContainerID, exists := idByName[svc.Name]
+		if !exists || oldContainerID == "" {
+			log.Printf("Scheduled restart for %s: container not running — will be created by next reconcile", svc.Name)
+			d.lastScheduledRestartMu.Lock()
+			d.lastScheduledRestart[restartKey] = now
+			d.lastScheduledRestartMu.Unlock()
+			continue
+		}
+
+		// ── Update policy: check for newer image before restarting ────
+		updatePolicy := svc.RestartAt.UpdatePolicy
+		if updatePolicy == "" {
+			updatePolicy = "always" // default: restart at scheduled time unconditionally
+		}
+
+		if updatePolicy == "latest" {
+			updateAvailable, newDigest, checkErr := d.containerClient.CheckImageUpdate(ctx, svc.Image, svc.RegistryAuth)
+			if checkErr != nil {
+				log.Printf("Scheduled restart for %s: image update check failed: %v — skipping this window", svc.Name, checkErr)
+				d.lastScheduledRestartMu.Lock()
+				d.lastScheduledRestart[restartKey] = now
+				d.lastScheduledRestartMu.Unlock()
+				continue
+			}
+			if !updateAvailable {
+				log.Printf("Scheduled check for %s: image is up-to-date — skipping restart", svc.Name)
+				d.lastScheduledRestartMu.Lock()
+				d.lastScheduledRestart[restartKey] = now
+				d.lastScheduledRestartMu.Unlock()
+				continue
+			}
+			log.Printf("Scheduled restart for %s: new image available (digest %s)", svc.Name, newDigest[:19])
+		}
+
+		log.Printf("Scheduled restart for %s at %s (rolling=%v, update_policy=%s)", svc.Name, currentTime, svc.RollingUpdate, updatePolicy)
+
+		if err := d.reconciler.RestartService(ctx, svc, oldContainerID); err != nil {
+			log.Printf("Scheduled restart for %s failed: %v", svc.Name, err)
+			continue
+		}
+
+		d.lastScheduledRestartMu.Lock()
+		d.lastScheduledRestart[svc.Name] = now
+		d.lastScheduledRestart[restartKey] = now
+		d.lastScheduledRestartMu.Unlock()
+
+		log.Printf("Scheduled restart for %s complete", svc.Name)
 	}
 }
 

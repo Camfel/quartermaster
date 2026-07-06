@@ -38,9 +38,52 @@ type Service struct {
 	Resources     *Resources     `yaml:"resources,omitempty"     json:"resources,omitempty"`
 	Ingress       *IngressConfig `yaml:"ingress,omitempty"       json:"ingress,omitempty"`
 
+	// RestartAt defines a periodic scheduled restart (e.g. daily at 3am).
+	// The container is stopped and redeployed, pulling the latest image.
+	// Use with rolling_update to avoid downtime during the restart.
+	RestartAt *RestartAt `yaml:"restart_at,omitempty"    json:"restart_at,omitempty"`
+
+	// RegistryAuth provides credentials for pulling from a private registry.
+	// References a qm secret (see RegistryAuth type docs).
+	RegistryAuth *RegistryAuth `yaml:"registry_auth,omitempty"  json:"registry_auth,omitempty"`
+
+	// RollingUpdate enables zero-downtime deploys: the new container is
+	// created and health-checked before the old one is stopped.
+	RollingUpdate bool `yaml:"rolling_update,omitempty" json:"rolling_update,omitempty"`
+
 	// ConfigHash is an internal field set by the reconciler for change detection.
 	// It is not serialized to YAML or JSON.
 	ConfigHash string `yaml:"-" json:"-"`
+}
+
+// RegistryAuth holds authentication credentials for pulling images from
+// a private registry.  The SecretRef points to a qm secret (encrypted with
+// NaCl secretbox) whose plaintext is a JSON object with "username" and
+// "password" keys.
+//
+// Example:
+//
+//	echo '{"username":"bot","password":"ghp_token"}' | qm secret create ghcr-creds
+//
+//	registry_auth:
+//	  secret_ref: ghcr-creds
+type RegistryAuth struct {
+	SecretRef string `yaml:"secret_ref" json:"secret_ref"` // qm secret name
+}
+
+// RestartAt defines a periodic scheduled restart for a service.  The daemon
+// checks every minute whether a restart window has opened and triggers a
+// redeploy, pulling the latest image.
+//
+// Example (daily at 3am local time):
+//
+//	restart_at:
+//	  time: "03:00"
+//	  frequency: daily
+type RestartAt struct {
+	Time         string `yaml:"time"                   json:"time"`                     // "HH:MM" in 24h local time
+	Frequency    string `yaml:"frequency"              json:"frequency"`                // "daily" (extensible: weekly, monthly)
+	UpdatePolicy string `yaml:"update_policy,omitempty" json:"update_policy,omitempty"` // "always" (default) or "latest"
 }
 
 // Resources defines hardware constraints for a service.

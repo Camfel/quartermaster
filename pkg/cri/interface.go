@@ -33,8 +33,9 @@ type ContainerStats struct {
 // ContainerClient defines the interface for interacting with a container runtime.
 // This abstraction allows us to mock the runtime for unit testing the reconciler.
 type ContainerClient interface {
-	// PullImage downloads an image from a registry.
-	PullImage(ctx context.Context, ref string) (string, error)
+	// PullImage downloads an image from a registry.  auth is optional registry
+	// credentials; pass nil for public images.
+	PullImage(ctx context.Context, ref string, auth *types.RegistryAuth) (string, error)
 
 	// CreateContainer sets up the container and its filesystem (snapshotter).
 	CreateContainer(ctx context.Context, svc types.Service) (string, error)
@@ -60,4 +61,10 @@ type ContainerClient interface {
 
 	// ContainerStats returns CPU and memory usage for a running container.
 	ContainerStats(ctx context.Context, containerID string) (*ContainerStats, error)
+
+	// CheckImageUpdate returns true if a newer version of the given image
+	// reference is available in the registry.  newDigest is the remote
+	// manifest digest, or empty if the check could not reach the registry.
+	// auth is optional; pass nil for public images.
+	CheckImageUpdate(ctx context.Context, ref string, auth *types.RegistryAuth) (updateAvailable bool, newDigest string, err error)
 }
