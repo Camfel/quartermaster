@@ -377,6 +377,21 @@ func verifyServices(timeout time.Duration) {
 		}
 		if allReady {
 			fmt.Println("  ✓ All services running")
+
+			// Verify dashboard endpoint.
+			fmt.Println("\n  Checking dashboard...")
+			data, err := daemonGet(socketPath, "/v1/dashboard")
+			if err != nil {
+				fmt.Printf("  ✗ Dashboard endpoint failed: %v\n", err)
+			} else {
+				html := string(data)
+				if strings.Contains(html, "<!DOCTYPE html>") && strings.Contains(html, "Quartermaster Dashboard") {
+					fmt.Println("  ✓ Dashboard endpoint responding")
+					fmt.Println("    View it:  curl --unix-socket /run/quartermaster/daemon.sock http://localhost/v1/dashboard")
+				} else {
+					fmt.Println("  ✗ Dashboard returned unexpected content")
+				}
+			}
 			return
 		}
 	}
