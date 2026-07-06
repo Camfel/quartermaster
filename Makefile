@@ -12,6 +12,7 @@
 BIN_DIR      ?= bin
 QM_BIN       ?= $(BIN_DIR)/qm
 DAEMON_BIN   ?= $(BIN_DIR)/qm-daemon
+TEST_BIN     ?= $(BIN_DIR)/qm-test
 INSTALL_DIR  ?= /usr/local/bin
 CONFIG_DIR   ?= /etc/quartermaster
 SYSTEMD_DIR  ?= /etc/systemd/system
@@ -50,14 +51,16 @@ build:
 	@mkdir -p $(BIN_DIR)
 	go build -trimpath -ldflags="$(LDFLAGS)" -o $(QM_BIN) ./cmd/qm
 	go build -trimpath -ldflags="$(LDFLAGS)" -o $(DAEMON_BIN) ./cmd/qm-daemon
-	@echo "✓ Binaries: $(QM_BIN)  $(DAEMON_BIN)"
+	go build -trimpath -ldflags="$(LDFLAGS)" -o $(TEST_BIN) ./cmd/qm-test
+	@echo "✓ Binaries: $(QM_BIN)  $(DAEMON_BIN)  $(TEST_BIN)"
 
 # Stripped production build.
 release:
 	@mkdir -p $(BIN_DIR)
 	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w $(LDFLAGS)" -o $(QM_BIN) ./cmd/qm
 	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w $(LDFLAGS)" -o $(DAEMON_BIN) ./cmd/qm-daemon
-	@echo "✓ Release binaries: $(QM_BIN)  $(DAEMON_BIN)"
+	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w $(LDFLAGS)" -o $(TEST_BIN) ./cmd/qm-test
+	@echo "✓ Release binaries: $(QM_BIN)  $(DAEMON_BIN)  $(TEST_BIN)"
 
 # Build + restart the running systemd daemon (dev loop).
 # Also recreates the dashboard container since the Unix socket

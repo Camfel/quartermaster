@@ -1,4 +1,5 @@
 /bin/
 /qm
 /qm-daemon
+/qm-test
 *.exe

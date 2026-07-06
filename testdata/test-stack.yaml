@@ -1,0 +1,30 @@
+# Quartermaster test stack — self-contained, no external credentials required.
+# All images are public and small.  Designed for automated verification on
+# a fresh Debian server.
+
+version: "1"
+kind: stack
+metadata:
+  name: qm-test
+
+spec:
+  services:
+    # ── Web server with health check ──────────────────────────────────
+    - name: test-web
+      image: nginx:alpine
+      network: internal
+      restart_policy: always
+      healthcheck:
+        type: http
+        path: /
+        port: 80
+        interval: 5s
+
+    # ── Simple long-running service (basic lifecycle test) ───────────
+    - name: test-sleeper
+      image: alpine:latest
+      network: internal
+      restart_policy: always
+      command:
+        - sleep
+        - infinity

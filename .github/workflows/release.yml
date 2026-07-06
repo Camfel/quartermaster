@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Build release binaries
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags="-s -w -X quartermaster/internal/daemon.apiVersion=${VERSION} -X main.version=${VERSION}" \
+            -o dist/qm ./cmd/qm
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags="-s -w -X quartermaster/internal/daemon.apiVersion=${VERSION} -X main.version=${VERSION}" \
+            -o dist/qm-daemon ./cmd/qm-daemon
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags="-s -w -X main.version=${VERSION}" \
+            -o dist/qm-test ./cmd/qm-test
+          chmod +x dist/qm dist/qm-daemon dist/qm-test
+          echo "Built ${VERSION}:"
+          ls -lh dist/
+
+      - name: Create release and upload artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "${{ github.ref_name }}"
+          generate_release_notes: true
+          files: |
+            dist/qm
+            dist/qm-daemon
+            dist/qm-test
