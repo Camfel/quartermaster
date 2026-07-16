@@ -176,12 +176,20 @@ func (rf *rotatingFile) Close() error {
 }
 
 // ContainerdClient is the real implementation of ContainerClient using containerd.
+// configManagerLookup is a minimal interface for ConfigMap key resolution.
+// The full config.ConfigManager is passed via WithConfigManager and satisfies this.
+type configManagerLookup interface {
+	ResolveConfigMap(name, key string) (string, error)
+	ListConfigMapKeys(name string) (map[string]string, error)
+}
+
 type ContainerdClient struct {
 	client    *containerd.Client
 	namespace string
-	secrets   *secrets.Manager   // optional: for secret injection
-	netMgr    network.NetManager // network: bridge, IPAM, port forwarding, VPN routing
-	hwDetect  *hardware.Detector // optional: for GPU device injection
+	secrets   *secrets.Manager    // optional: for secret injection
+	netMgr    network.NetManager  // network: bridge, IPAM, port forwarding, VPN routing
+	hwDetect  *hardware.Detector  // optional: for GPU device injection
+	configMgr configManagerLookup // optional: for ConfigMap resolution
 
 	logs   *logStore
 	logDir string // directory for per-container log files
@@ -230,6 +238,12 @@ func (c *ContainerdClient) WithHardwareDetector(hd *hardware.Detector) *Containe
 // in-memory ring buffer, so logs survive daemon restarts.
 func (c *ContainerdClient) WithLogDir(dir string) *ContainerdClient {
 	c.logDir = dir
+	return c
+}
+
+// WithConfigManager sets a ConfigMap resolver for env-var and volume injection.
+func (c *ContainerdClient) WithConfigManager(cm configManagerLookup) *ContainerdClient {
+	c.configMgr = cm
 	return c
 }
 
@@ -422,7 +436,36 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 	// ── 1. Add Environment Variables ───────────────────────────────
 	var envVars []string
 	for _, env := range svc.Env {
-		if env.Value != "" {
+		resolved := false
+		if env.ValueFrom != nil {
+			if env.ValueFrom.SecretRef != "" && c.secrets != nil {
+				sd, err := c.secrets.Resolve(env.Name, env.ValueFrom.SecretRef)
+				if err == nil {
+					envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, sd))
+					resolved = true
+					log.Printf("Injected secret %s → env %s for container %s", env.ValueFrom.SecretRef, env.Name, svc.Name)
+				} else {
+					log.Printf("Warning: failed to resolve secret %s for %s: %v", env.ValueFrom.SecretRef, svc.Name, err)
+				}
+			}
+
+			if !resolved && env.ValueFrom.ConfigMapRef != "" && c.configMgr != nil {
+				key := env.ValueFrom.Key
+				if key == "" {
+					key = env.Name
+				}
+				val, err := c.configMgr.ResolveConfigMap(env.ValueFrom.ConfigMapRef, key)
+				if err == nil {
+					envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, val))
+					resolved = true
+					log.Printf("ConfigMap %s/%s → env %s=%s for container %s", env.ValueFrom.ConfigMapRef, key, env.Name, val, svc.Name)
+				} else {
+					log.Printf("ConfigMap %s/%s not resolved for %s: %v", env.ValueFrom.ConfigMapRef, key, svc.Name, err)
+				}
+			}
+		}
+
+		if !resolved && env.Value != "" {
 			envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, env.Value))
 		}
 	}

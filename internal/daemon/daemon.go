@@ -8,7 +8,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -240,6 +243,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 // reconcile loads the stack file and runs reconciliation.
 func (d *Daemon) reconcile(ctx context.Context) error {
 	start := time.Now()
+
+	// Load ConfigMaps from configmaps directories before reconciliation.
+	d.loadConfigMaps()
 
 	reconCtx, cancel := context.WithTimeout(ctx, d.syncInterval)
 	if d.syncInterval > 2*time.Second {
@@ -505,6 +511,48 @@ func (d *Daemon) runScheduledRestarts(ctx context.Context) {
 
 		log.Printf("Scheduled restart for %s complete", svc.Name)
 	}
+}
+
+// loadConfigMaps scans directories for ConfigMap YAML files.
+func (d *Daemon) loadConfigMaps() {
+	dirs := d.stackDirs()
+	dirs = append(dirs, "/etc/quartermaster/configmaps")
+
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".yaml") {
+				continue
+			}
+			path := filepath.Join(dir, entry.Name())
+			if _, err := d.configManager.LoadConfigMap(path); err != nil {
+				continue
+			}
+		}
+	}
+}
+
+// stackDirs returns unique directories containing stack files.
+func (d *Daemon) stackDirs() []string {
+	dirs := []string{filepath.Dir(d.stackFile)}
+	seen := map[string]bool{dirs[0]: true}
+
+	settings, sErr := config.LoadSettings(d.settingsPath)
+	if sErr != nil {
+		return dirs
+	}
+
+	for _, p := range settings.StackFiles() {
+		dir := filepath.Dir(p)
+		if !seen[dir] {
+			seen[dir] = true
+			dirs = append(dirs, dir)
+		}
+	}
+	return dirs
 }
 
 // loadMergedStack loads the primary stack and merges all additional stacks

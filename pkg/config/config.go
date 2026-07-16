@@ -17,11 +17,15 @@ import (
 )
 
 // ConfigManager handles loading and validating configurations.
-type ConfigManager struct{}
+type ConfigManager struct {
+	configMaps map[string]*types.ConfigMap
+}
 
 // NewConfigManager creates a new instance of ConfigManager.
 func NewConfigManager() *ConfigManager {
-	return &ConfigManager{}
+	return &ConfigManager{
+		configMaps: make(map[string]*types.ConfigMap),
+	}
 }
 
 // LoadStack reads a YAML file from the given path and unmarshals it into a Stack.
@@ -68,6 +72,58 @@ func (cm *ConfigManager) SaveStack(path string, stack *types.Stack) error {
 	return nil
 }
 
+// ── ConfigMap operations ─────────────────────────────────────────────
+
+// LoadConfigMap reads a ConfigMap YAML file and registers it by name.
+func (cm *ConfigManager) LoadConfigMap(path string) (*types.ConfigMap, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read configmap file: %w", err)
+	}
+
+	var cmap types.ConfigMap
+	if err := yaml.Unmarshal(data, &cmap); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal configmap: %w", err)
+	}
+
+	if cmap.Kind != "ConfigMap" {
+		return nil, fmt.Errorf("expected kind ConfigMap, got %q", cmap.Kind)
+	}
+	if cmap.Metadata.Name == "" {
+		return nil, fmt.Errorf("configmap metadata.name is required")
+	}
+
+	cm.RegisterConfigMap(&cmap)
+	return &cmap, nil
+}
+
+// RegisterConfigMap adds a ConfigMap to the registry directly.
+func (cm *ConfigManager) RegisterConfigMap(cmap *types.ConfigMap) {
+	cm.configMaps[cmap.Metadata.Name] = cmap
+}
+
+// ResolveConfigMap looks up a key in a registered ConfigMap.
+func (cm *ConfigManager) ResolveConfigMap(name, key string) (string, error) {
+	cmap, ok := cm.configMaps[name]
+	if !ok {
+		return "", fmt.Errorf("configmap %q not found", name)
+	}
+	val, ok := cmap.Data[key]
+	if !ok {
+		return "", fmt.Errorf("key %q not found in configmap %q", key, name)
+	}
+	return val, nil
+}
+
+// ListConfigMapKeys returns all key-value pairs in a registered ConfigMap.
+func (cm *ConfigManager) ListConfigMapKeys(name string) (map[string]string, error) {
+	cmap, ok := cm.configMaps[name]
+	if !ok {
+		return nil, fmt.Errorf("configmap %q not found", name)
+	}
+	return cmap.Data, nil
+}
+
 // MergeStacks combines two stacks into one. Services from the second stack
 // are appended to the first.  The first stack's metadata is preserved.
 // Duplicate service names: the first stack wins.
@@ -96,10 +152,11 @@ var validRestartPolicies = map[string]bool{
 
 // validVolumeTypes defines the allowed volume type values.
 var validVolumeTypes = map[string]bool{
-	"bind":   true,
-	"volume": true,
-	"tmpfs":  true,
-	"":       true, // empty defaults to "bind"
+	"bind":      true,
+	"volume":    true,
+	"tmpfs":     true,
+	"configmap": true,
+	"":          true, // empty defaults to "bind"
 }
 
 // validHealthCheckTypes defines the allowed health check probe types.
