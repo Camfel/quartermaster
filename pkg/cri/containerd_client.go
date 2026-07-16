@@ -473,16 +473,43 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 		specOpts = append(specOpts, oci.WithEnv(envVars))
 	}
 
+	// Mount cleanups — declared early so configmap volumes can reference them.
+	var secretCleanup func()
+	var configMapCleanups []func()
+
 	// ── 2. Add Volume Mounts ───────────────────────────────────────
 	for _, vol := range svc.Volumes {
-		specOpts = append(specOpts, oci.WithMounts([]specs.Mount{
-			{
-				Type:        vol.Type,
-				Source:      vol.Source,
-				Destination: vol.Target,
-				Options:     []string{"bind", "rw"},
-			},
-		}))
+		if vol.Type == "configmap" && vol.ConfigMap != nil && c.configMgr != nil {
+			mountDir, cleanup, err := c.prepareConfigMapMount(vol)
+			if err != nil {
+				if secretCleanup != nil {
+					secretCleanup()
+				}
+				for _, c := range configMapCleanups {
+					c()
+				}
+				return "", fmt.Errorf("configmap volume %s: %w", vol.ConfigMap.Name, err)
+			}
+			configMapCleanups = append(configMapCleanups, cleanup)
+
+			specOpts = append(specOpts, oci.WithMounts([]specs.Mount{
+				{
+					Type:        "bind",
+					Source:      mountDir,
+					Destination: vol.Target,
+					Options:     []string{"bind", "ro"},
+				},
+			}))
+		} else {
+			specOpts = append(specOpts, oci.WithMounts([]specs.Mount{
+				{
+					Type:        vol.Type,
+					Source:      vol.Source,
+					Destination: vol.Target,
+					Options:     []string{"bind", "rw"},
+				},
+			}))
+		}
 	}
 
 	// ── 3. Set User ────────────────────────────────────────────────
@@ -491,7 +518,6 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 	}
 
 	// ── 4. Inject Secrets ──────────────────────────────────────────
-	var secretCleanup func()
 	if c.secrets != nil && len(svc.Secrets) > 0 {
 		secretRefs := make([]secrets.SecretRef, len(svc.Secrets))
 		for i, s := range svc.Secrets {
@@ -499,6 +525,9 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 		}
 		mountDir, cleanup, err := c.secrets.PrepareMountDir(secretRefs)
 		if err != nil {
+			for _, c := range configMapCleanups {
+				c()
+			}
 			return "", fmt.Errorf("failed to prepare secrets for %s: %w", svc.Name, err)
 		}
 		secretCleanup = cleanup // stored after container creation succeeds
@@ -620,12 +649,22 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 		if secretCleanup != nil {
 			secretCleanup()
 		}
+		for _, cleanup := range configMapCleanups {
+			cleanup()
+		}
 		return "", fmt.Errorf("failed to create container %s: %w", svc.Name, err)
 	}
 
-	// Store secret mount cleanup for when the container is deleted.
-	if secretCleanup != nil {
-		c.mountCleanups[container.ID()] = secretCleanup
+	// Store secret and configmap mount cleanups for when the container is deleted.
+	if secretCleanup != nil || len(configMapCleanups) > 0 {
+		c.mountCleanups[container.ID()] = func() {
+			if secretCleanup != nil {
+				secretCleanup()
+			}
+			for _, cleanup := range configMapCleanups {
+				cleanup()
+			}
+		}
 	}
 
 	return container.ID(), nil
@@ -650,6 +689,32 @@ func resolveVPNGateway(nm network.NetManager, netProfile string, dependsOn []str
 }
 
 // StartContainer starts a task for the container.
+// prepareConfigMapMount creates a temporary directory containing all keys
+// from a ConfigMap as individual files, and returns the directory path along
+// with a cleanup function that removes it.
+func (c *ContainerdClient) prepareConfigMapMount(vol types.Volume) (string, func(), error) {
+	data, err := c.configMgr.ListConfigMapKeys(vol.ConfigMap.Name)
+	if err != nil {
+		return "", nil, fmt.Errorf("configmap %q: %w", vol.ConfigMap.Name, err)
+	}
+
+	dir, err := os.MkdirTemp("", "quartermaster-configmap-")
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create configmap tmp dir: %w", err)
+	}
+
+	cleanup := func() { os.RemoveAll(dir) }
+
+	for key, value := range data {
+		if err := os.WriteFile(filepath.Join(dir, key), []byte(value), 0444); err != nil {
+			cleanup()
+			return "", nil, fmt.Errorf("failed to write configmap key %q: %w", key, err)
+		}
+	}
+
+	return dir, cleanup, nil
+}
+
 func (c *ContainerdClient) StartContainer(ctx context.Context, containerID string) error {
 	ctx = c.withNamespace(ctx)
 	log.Printf("Starting container: %s", containerID)

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 
 	"quartermaster/pkg/types"
 
@@ -18,6 +19,7 @@ import (
 
 // ConfigManager handles loading and validating configurations.
 type ConfigManager struct {
+	mu         sync.RWMutex
 	configMaps map[string]*types.ConfigMap
 }
 
@@ -99,11 +101,15 @@ func (cm *ConfigManager) LoadConfigMap(path string) (*types.ConfigMap, error) {
 
 // RegisterConfigMap adds a ConfigMap to the registry directly.
 func (cm *ConfigManager) RegisterConfigMap(cmap *types.ConfigMap) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
 	cm.configMaps[cmap.Metadata.Name] = cmap
 }
 
 // ResolveConfigMap looks up a key in a registered ConfigMap.
 func (cm *ConfigManager) ResolveConfigMap(name, key string) (string, error) {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
 	cmap, ok := cm.configMaps[name]
 	if !ok {
 		return "", fmt.Errorf("configmap %q not found", name)
@@ -117,6 +123,8 @@ func (cm *ConfigManager) ResolveConfigMap(name, key string) (string, error) {
 
 // ListConfigMapKeys returns all key-value pairs in a registered ConfigMap.
 func (cm *ConfigManager) ListConfigMapKeys(name string) (map[string]string, error) {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
 	cmap, ok := cm.configMaps[name]
 	if !ok {
 		return nil, fmt.Errorf("configmap %q not found", name)
@@ -242,14 +250,18 @@ func (cm *ConfigManager) validate(stack *types.Stack) error {
 
 		// Volume validation
 		for _, vol := range svc.Volumes {
-			if vol.Source == "" {
+			if vol.Type == "configmap" {
+				if vol.ConfigMap == nil || vol.ConfigMap.Name == "" {
+					return fmt.Errorf("service %q: configmap volume requires configMap.name", svc.Name)
+				}
+			} else if vol.Source == "" {
 				return fmt.Errorf("service %q: volume source is required", svc.Name)
 			}
 			if vol.Target == "" {
 				return fmt.Errorf("service %q: volume target is required", svc.Name)
 			}
 			if !validVolumeTypes[vol.Type] {
-				return fmt.Errorf("service %q: invalid volume type %q (must be one of: bind, volume, tmpfs)", svc.Name, vol.Type)
+				return fmt.Errorf("service %q: invalid volume type %q (must be one of: bind, volume, tmpfs, configmap)", svc.Name, vol.Type)
 			}
 		}
 

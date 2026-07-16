@@ -529,6 +529,11 @@ func (d *Daemon) loadConfigMaps() {
 			}
 			path := filepath.Join(dir, entry.Name())
 			if _, err := d.configManager.LoadConfigMap(path); err != nil {
+				// Skip non-ConfigMap YAML files (stacks, etc.) silently.
+				// Log real errors (parse failures, missing name) for debugging.
+				if !strings.Contains(err.Error(), "expected kind ConfigMap") {
+					log.Printf("Warning: failed to load configmap %s: %v", path, err)
+				}
 				continue
 			}
 		}

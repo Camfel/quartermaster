@@ -3,3 +3,5 @@
 /qm-daemon
 /qm-test
 *.exe
+.pi-subagents/
+review-findings.md
