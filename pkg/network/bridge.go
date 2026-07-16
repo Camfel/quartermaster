@@ -886,6 +886,15 @@ func (b *BridgeManager) setupVPNRouting(nsName, containerIP, gatewayIP, ctrVeth 
 	}
 	defer handle.Delete()
 
+	// Get the veth link index so routes resolve correctly.
+	// Without LinkIndex the kernel may fail with "no such device"
+	// when the gateway isn't directly attached to any interface.
+	ctrLink, err := handle.LinkByName(ctrVeth)
+	if err != nil {
+		return fmt.Errorf("find %s in ns %s: %w", ctrVeth, nsName, err)
+	}
+	linkIndex := ctrLink.Attrs().Index
+
 	// Source-based policy routing: traffic FROM this container's IP
 	// uses table 100 which routes through the VPN gateway.  This is
 	// more reliable than fwmark-based routing which can lose marks
@@ -907,9 +916,10 @@ func (b *BridgeManager) setupVPNRouting(nsName, containerIP, gatewayIP, ctrVeth 
 		{&net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}, gw}, // internet via VPN
 	} {
 		route := &netlink.Route{
-			Dst:   entry.dst,
-			Gw:    entry.gw,
-			Table: vpnRouteTable,
+			LinkIndex: linkIndex,
+			Dst:       entry.dst,
+			Gw:        entry.gw,
+			Table:     vpnRouteTable,
 		}
 		if err := handle.RouteAdd(route); err != nil && !os.IsExist(err) {
 			return fmt.Errorf("add route to table %d: %w", vpnRouteTable, err)
