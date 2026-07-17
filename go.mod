@@ -1,10 +1,10 @@
 module quartermaster
 
-go 1.25.0
+go 1.25.12
 
 require (
 	github.com/containerd/cgroups v1.1.0
-	github.com/containerd/containerd v1.7.32
+	github.com/containerd/containerd v1.7.34
 	github.com/containerd/containerd/api v1.8.0
 	github.com/coreos/go-iptables v0.8.0
 	github.com/go-git/go-git/v5 v5.19.1
