@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -253,30 +254,52 @@ func (c *ContainerdClient) withNamespace(ctx context.Context) context.Context {
 }
 
 // PullImage pulls an image from the registry.  If the image is already
-// present locally, the pull is skipped and the local image is returned.
+// present locally AND the registry still points at the same digest, the
+// pull is skipped and the local image is returned.  If the remote digest
+// has moved (mutable tags like :latest), the image is pulled so services
+// don't run stale copies forever.  Images that only exist locally (built
+// on this host, never pushed) fail the registry check and are kept as-is.
 // auth provides optional credentials for private registries.
 func (c *ContainerdClient) PullImage(ctx context.Context, ref string, auth *types.RegistryAuth) (string, error) {
 	ctx = c.withNamespace(ctx)
 
 	fullRef := qualifyImageRef(ref)
 
-	// Check if already present locally — skip the registry round-trip.
+	// Image pulls must not be bound by the caller's deadline — the reconcile
+	// pass runs on a ~1 minute budget, and large images can take several
+	// minutes to download.  Give the registry round-trips their own budget.
+	pullCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Minute)
+	defer cancel()
+
+	// Check if already present locally — only skip the registry round-trip
+	// when the remote digest matches the local copy.
 	if localImage, localErr := c.client.GetImage(ctx, fullRef); localErr == nil {
-		return localImage.Name(), nil
+		info, resolveErr := c.resolveRemoteDigest(pullCtx, fullRef, auth)
+		if resolveErr != nil {
+			// Registry unreachable or image only exists locally — fall back
+			// to the local copy rather than failing the service.
+			log.Printf("PullImage %s: registry check failed (%v) — using local image", fullRef, resolveErr)
+			return localImage.Name(), nil
+		}
+		if info.matches(localImage.Target().Digest.String()) {
+			return localImage.Name(), nil
+		}
+		log.Printf("Image %s has an update: local=%s remote=%s — pulling", fullRef,
+			localImage.Target().Digest.String()[:19], info.Remote())
 	}
 
 	log.Printf("Pulling image: %s", fullRef)
 
 	pullOpts := []containerd.RemoteOpt{containerd.WithPullUnpack}
 	if auth != nil {
-		resolver, rErr := c.authenticatedResolver(ctx, auth)
+		resolver, rErr := c.authenticatedResolver(pullCtx, auth)
 		if rErr != nil {
 			return "", fmt.Errorf("registry auth for %s: %w", fullRef, rErr)
 		}
 		pullOpts = append(pullOpts, containerd.WithResolver(resolver))
 	}
 
-	image, err := c.client.Pull(ctx, fullRef, pullOpts...)
+	image, err := c.client.Pull(pullCtx, fullRef, pullOpts...)
 	if err != nil {
 		return "", fmt.Errorf("failed to pull image %s: %w", fullRef, err)
 	}
@@ -299,12 +322,64 @@ func (c *ContainerdClient) CheckImageUpdate(ctx context.Context, ref string, aut
 	}
 	// If the image isn't present locally, there's definitely an "update".
 
+	remote, err := c.resolveRemoteDigest(ctx, fullRef, auth)
+	if err != nil {
+		return false, "", err
+	}
+
+	if localDigest == "" {
+		return true, remote.Remote(), nil
+	}
+
+	if !remote.matches(localDigest) {
+		log.Printf("Image %s has an update: local=%s remote=%s", fullRef,
+			localDigest[:19], remote.Remote()[:19])
+		return true, remote.Remote(), nil
+	}
+
+	return false, "", nil
+}
+
+// remoteDigestInfo holds the registry digests for an image ref: Top is the
+// digest of the resolved top-level descriptor (the index for multi-arch
+// images) and Child is the digest of the platform-specific manifest selected
+// for this host (empty for single-platform images).  Containerd's local image
+// target can be either shape depending on what the registry served at pull
+// time, so both must be accepted as "current".
+type remoteDigestInfo struct {
+	Top   string
+	Child string
+}
+
+// Remote returns the digest most useful for reporting: the platform-specific
+// child when present, otherwise the top-level digest.
+func (d remoteDigestInfo) Remote() string {
+	if d.Child != "" {
+		return d.Child
+	}
+	return d.Top
+}
+
+// matches reports whether a locally-stored image digest is current.
+func (d remoteDigestInfo) matches(local string) bool {
+	if local == d.Top {
+		return true
+	}
+	return d.Child != "" && local == d.Child
+}
+
+// resolveRemoteDigest queries the registry for the current digests of the
+// image at fullRef.  For multi-arch indexes it also returns the digest of the
+// platform-specific child manifest matching this host (GOOS/GOARCH), falling
+// back to the first entry if there is no match.  auth provides optional
+// credentials for private registries.
+func (c *ContainerdClient) resolveRemoteDigest(ctx context.Context, fullRef string, auth *types.RegistryAuth) (remoteDigestInfo, error) {
 	// ── Build resolver (authenticated if registry_auth is set) ───────
 	var resolver remotes.Resolver
 	if auth != nil {
 		authResolver, rErr := c.authenticatedResolver(ctx, auth)
 		if rErr != nil {
-			return false, "", fmt.Errorf("registry auth for %s: %w", fullRef, rErr)
+			return remoteDigestInfo{}, fmt.Errorf("registry auth for %s: %w", fullRef, rErr)
 		}
 		resolver = authResolver
 	} else {
@@ -316,21 +391,67 @@ func (c *ContainerdClient) CheckImageUpdate(ctx context.Context, ref string, aut
 	// Resolve returns the name and descriptor (with digest) from the registry.
 	_, desc, err := resolver.Resolve(ctx, fullRef)
 	if err != nil {
-		return false, "", fmt.Errorf("failed to resolve remote image %s: %w", fullRef, err)
-	}
-	remoteDigest := desc.Digest.String()
-
-	if localDigest == "" {
-		return true, remoteDigest, nil
+		return remoteDigestInfo{}, fmt.Errorf("failed to resolve remote image %s: %w", fullRef, err)
 	}
 
-	if localDigest != remoteDigest {
-		log.Printf("Image %s has an update: local=%s remote=%s", fullRef,
-			localDigest[:19], remoteDigest[:19])
-		return true, remoteDigest, nil
+	info := remoteDigestInfo{Top: desc.Digest.String()}
+
+	// Single-platform manifest — there is no child manifest to select.
+	if !isIndexMediaType(desc.MediaType) {
+		return info, nil
 	}
 
-	return false, "", nil
+	// Multi-arch index — fetch it and select the child manifest for this host.
+	fetcher, err := resolver.Fetcher(ctx, fullRef)
+	if err != nil {
+		return remoteDigestInfo{}, fmt.Errorf("fetch index for %s: %w", fullRef, err)
+	}
+	content, err := fetcher.Fetch(ctx, desc)
+	if err != nil {
+		return remoteDigestInfo{}, fmt.Errorf("fetch index content for %s: %w", fullRef, err)
+	}
+	defer content.Close()
+
+	raw, err := io.ReadAll(content)
+	if err != nil {
+		return remoteDigestInfo{}, fmt.Errorf("read index for %s: %w", fullRef, err)
+	}
+
+	var idx remoteIndex
+	if err := json.Unmarshal(raw, &idx); err != nil {
+		return remoteDigestInfo{}, fmt.Errorf("parse index for %s: %w", fullRef, err)
+	}
+
+	for _, m := range idx.Manifests {
+		if m.Platform != nil && m.Platform.OS == runtime.GOOS && m.Platform.Architecture == runtime.GOARCH {
+			info.Child = m.Digest
+			return info, nil
+		}
+	}
+	if len(idx.Manifests) > 0 {
+		info.Child = idx.Manifests[0].Digest
+	}
+	return info, nil
+}
+
+// isIndexMediaType reports whether a media type is a multi-arch image index
+// (OCI index or Docker manifest list).
+func isIndexMediaType(mt string) bool {
+	return mt == "application/vnd.oci.image.index.v1+json" ||
+		mt == "application/vnd.docker.distribution.manifest.list.v2+json"
+}
+
+// remoteIndex is the minimal JSON shape of a multi-arch image index.
+type remoteIndex struct {
+	MediaType string `json:"mediaType"`
+	Manifests []struct {
+		MediaType string `json:"mediaType"`
+		Digest    string `json:"digest"`
+		Platform  *struct {
+			Architecture string `json:"architecture"`
+			OS           string `json:"os"`
+		} `json:"platform"`
+	} `json:"manifests"`
 }
 
 // registryCreds is the on-disk format for a registry-credentials secret.
