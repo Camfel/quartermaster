@@ -136,6 +136,17 @@ func (cm *ConfigManager) ListConfigMapKeys(name string) (map[string]string, erro
 // are appended to the first.  The first stack's metadata is preserved.
 // Duplicate service names: the first stack wins.
 func (cm *ConfigManager) MergeStacks(base, additional *types.Stack) *types.Stack {
+	// Later stacks win on service name conflicts.  StackFiles() orders
+	// component stacks first and user repos last, so repo overrides must
+	// replace (not be dropped by) component defaults.
+	for i := range base.Spec.Services {
+		for _, svc := range additional.Spec.Services {
+			if svc.Name == base.Spec.Services[i].Name {
+				base.Spec.Services[i] = svc
+				break
+			}
+		}
+	}
 	seen := make(map[string]bool, len(base.Spec.Services))
 	for _, svc := range base.Spec.Services {
 		seen[svc.Name] = true

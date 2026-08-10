@@ -6,6 +6,120 @@ import (
 	"quartermaster/pkg/types"
 )
 
+func TestMergeStacks_UserRepoOverridesComponent(t *testing.T) {
+	// Regression test: component stacks are merged first, user repos last.
+	// A user-repo service with the same name must REPLACE the component
+	// default — not be dropped (previously first-wins, so component defaults
+	// silently won and repo overrides never landed).
+	cm := NewConfigManager()
+
+	component := &types.Stack{
+		Version:  "1",
+		Kind:     "Stack",
+		Metadata: types.Metadata{Name: "component"},
+		Spec: types.StackSpec{
+			Services: []types.Service{
+				{
+					Name:  "sabnzbd",
+					Image: "lscr.io/linuxserver/sabnzbd:latest",
+					Env: []types.EnvVar{
+						{Name: "TZ", Value: "Etc/UTC"},
+					},
+				},
+			},
+		},
+	}
+	repo := &types.Stack{
+		Version:  "1",
+		Kind:     "Stack",
+		Metadata: types.Metadata{Name: "repo"},
+		Spec: types.StackSpec{
+			Services: []types.Service{
+				{
+					Name:  "sabnzbd",
+					Image: "lscr.io/linuxserver/sabnzbd:latest",
+					Env: []types.EnvVar{
+						{Name: "TZ", Value: "Australia/Sydney"},
+						{Name: "SAB_CONNECTIONS", Value: "30"},
+					},
+					Command: []string{"sh", "-c", "exec /init"},
+				},
+				{
+					Name:  "repo-only",
+					Image: "alpine:latest",
+				},
+			},
+		},
+	}
+
+	merged := cm.MergeStacks(component, repo)
+
+	if len(merged.Spec.Services) != 2 {
+		t.Fatalf("expected 2 services, got %d", len(merged.Spec.Services))
+	}
+
+	var sab types.Service
+	for _, s := range merged.Spec.Services {
+		if s.Name == "sabnzbd" {
+			sab = s
+		}
+	}
+	if sab.Name != "sabnzbd" {
+		t.Fatal("sabnzbd not found in merged stack")
+	}
+
+	// The repo override must win on conflicts.
+	tz := ""
+	conn := ""
+	for _, e := range sab.Env {
+		if e.Name == "TZ" {
+			tz = e.Value
+		}
+		if e.Name == "SAB_CONNECTIONS" {
+			conn = e.Value
+		}
+	}
+	if tz != "Australia/Sydney" {
+		t.Errorf("expected repo TZ to win, got %q", tz)
+	}
+	if conn != "30" {
+		t.Errorf("expected SAB_CONNECTIONS=30, got %q", conn)
+	}
+	if len(sab.Command) == 0 {
+		t.Error("expected repo command to win")
+	}
+}
+
+func TestMergeStacks_AppendsNewServices(t *testing.T) {
+	cm := NewConfigManager()
+
+	base := &types.Stack{
+		Version:  "1",
+		Kind:     "Stack",
+		Metadata: types.Metadata{Name: "base"},
+		Spec: types.StackSpec{
+			Services: []types.Service{
+				{Name: "base-svc", Image: "alpine:latest"},
+			},
+		},
+	}
+	additional := &types.Stack{
+		Version:  "1",
+		Kind:     "Stack",
+		Metadata: types.Metadata{Name: "additional"},
+		Spec: types.StackSpec{
+			Services: []types.Service{
+				{Name: "new-svc", Image: "busybox:latest"},
+			},
+		},
+	}
+
+	merged := cm.MergeStacks(base, additional)
+	if len(merged.Spec.Services) != 2 {
+		t.Fatalf("expected 2 services, got %d", len(merged.Spec.Services))
+	}
+}
+
 func TestLoadStack_Valid(t *testing.T) {
 	cm := NewConfigManager()
 	stack, err := cm.LoadStack("testdata/valid.yaml")
