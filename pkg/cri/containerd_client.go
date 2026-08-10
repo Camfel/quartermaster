@@ -5,11 +5,14 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +31,8 @@ import (
 	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/remotes"
+	"github.com/containerd/containerd/remotes/docker"
 	gogoproto "github.com/gogo/protobuf/proto"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -172,12 +177,20 @@ func (rf *rotatingFile) Close() error {
 }
 
 // ContainerdClient is the real implementation of ContainerClient using containerd.
+// configManagerLookup is a minimal interface for ConfigMap key resolution.
+// The full config.ConfigManager is passed via WithConfigManager and satisfies this.
+type configManagerLookup interface {
+	ResolveConfigMap(name, key string) (string, error)
+	ListConfigMapKeys(name string) (map[string]string, error)
+}
+
 type ContainerdClient struct {
 	client    *containerd.Client
 	namespace string
-	secrets   *secrets.Manager   // optional: for secret injection
-	netMgr    network.NetManager // network: bridge, IPAM, port forwarding, VPN routing
-	hwDetect  *hardware.Detector // optional: for GPU device injection
+	secrets   *secrets.Manager    // optional: for secret injection
+	netMgr    network.NetManager  // network: bridge, IPAM, port forwarding, VPN routing
+	hwDetect  *hardware.Detector  // optional: for GPU device injection
+	configMgr configManagerLookup // optional: for ConfigMap resolution
 
 	logs   *logStore
 	logDir string // directory for per-container log files
@@ -229,31 +242,260 @@ func (c *ContainerdClient) WithLogDir(dir string) *ContainerdClient {
 	return c
 }
 
+// WithConfigManager sets a ConfigMap resolver for env-var and volume injection.
+func (c *ContainerdClient) WithConfigManager(cm configManagerLookup) *ContainerdClient {
+	c.configMgr = cm
+	return c
+}
+
 // withNamespace is a helper to wrap the context with the quartermaster namespace.
 func (c *ContainerdClient) withNamespace(ctx context.Context) context.Context {
 	return namespaces.WithNamespace(ctx, c.namespace)
 }
 
 // PullImage pulls an image from the registry.  If the image is already
-// present locally, the pull is skipped and the local image is returned.
-func (c *ContainerdClient) PullImage(ctx context.Context, ref string) (string, error) {
+// present locally AND the registry still points at the same digest, the
+// pull is skipped and the local image is returned.  If the remote digest
+// has moved (mutable tags like :latest), the image is pulled so services
+// don't run stale copies forever.  Images that only exist locally (built
+// on this host, never pushed) fail the registry check and are kept as-is.
+// auth provides optional credentials for private registries.
+func (c *ContainerdClient) PullImage(ctx context.Context, ref string, auth *types.RegistryAuth) (string, error) {
 	ctx = c.withNamespace(ctx)
 
 	fullRef := qualifyImageRef(ref)
 
-	// Check if already present locally — skip the registry round-trip.
+	// Image pulls must not be bound by the caller's deadline — the reconcile
+	// pass runs on a ~1 minute budget, and large images can take several
+	// minutes to download.  Give the registry round-trips their own budget.
+	pullCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Minute)
+	defer cancel()
+
+	// Check if already present locally — only skip the registry round-trip
+	// when the remote digest matches the local copy.
 	if localImage, localErr := c.client.GetImage(ctx, fullRef); localErr == nil {
-		return localImage.Name(), nil
+		info, resolveErr := c.resolveRemoteDigest(pullCtx, fullRef, auth)
+		if resolveErr != nil {
+			// Registry unreachable or image only exists locally — fall back
+			// to the local copy rather than failing the service.
+			log.Printf("PullImage %s: registry check failed (%v) — using local image", fullRef, resolveErr)
+			return localImage.Name(), nil
+		}
+		if info.matches(localImage.Target().Digest.String()) {
+			return localImage.Name(), nil
+		}
+		log.Printf("Image %s has an update: local=%s remote=%s — pulling", fullRef,
+			localImage.Target().Digest.String()[:19], info.Remote())
 	}
 
 	log.Printf("Pulling image: %s", fullRef)
 
-	image, err := c.client.Pull(ctx, fullRef, containerd.WithPullUnpack)
+	pullOpts := []containerd.RemoteOpt{containerd.WithPullUnpack}
+	if auth != nil {
+		resolver, rErr := c.authenticatedResolver(pullCtx, auth)
+		if rErr != nil {
+			return "", fmt.Errorf("registry auth for %s: %w", fullRef, rErr)
+		}
+		pullOpts = append(pullOpts, containerd.WithResolver(resolver))
+	}
+
+	image, err := c.client.Pull(pullCtx, fullRef, pullOpts...)
 	if err != nil {
 		return "", fmt.Errorf("failed to pull image %s: %w", fullRef, err)
 	}
 
 	return image.Name(), nil
+}
+
+// CheckImageUpdate compares the local image digest with the remote registry
+// manifest digest.  Returns (true, newDigest, nil) when a newer version is
+// available, (false, "", nil) when up-to-date, or (false, "", error) on failure.
+// auth provides optional credentials for private registries.
+func (c *ContainerdClient) CheckImageUpdate(ctx context.Context, ref string, auth *types.RegistryAuth) (bool, string, error) {
+	ctx = c.withNamespace(ctx)
+	fullRef := qualifyImageRef(ref)
+
+	// ── Resolve local digest ─────────────────────────────────────────
+	var localDigest string
+	if img, err := c.client.GetImage(ctx, fullRef); err == nil {
+		localDigest = img.Target().Digest.String()
+	}
+	// If the image isn't present locally, there's definitely an "update".
+
+	remote, err := c.resolveRemoteDigest(ctx, fullRef, auth)
+	if err != nil {
+		return false, "", err
+	}
+
+	if localDigest == "" {
+		return true, remote.Remote(), nil
+	}
+
+	if !remote.matches(localDigest) {
+		log.Printf("Image %s has an update: local=%s remote=%s", fullRef,
+			localDigest[:19], remote.Remote()[:19])
+		return true, remote.Remote(), nil
+	}
+
+	return false, "", nil
+}
+
+// remoteDigestInfo holds the registry digests for an image ref: Top is the
+// digest of the resolved top-level descriptor (the index for multi-arch
+// images) and Child is the digest of the platform-specific manifest selected
+// for this host (empty for single-platform images).  Containerd's local image
+// target can be either shape depending on what the registry served at pull
+// time, so both must be accepted as "current".
+type remoteDigestInfo struct {
+	Top   string
+	Child string
+}
+
+// Remote returns the digest most useful for reporting: the platform-specific
+// child when present, otherwise the top-level digest.
+func (d remoteDigestInfo) Remote() string {
+	if d.Child != "" {
+		return d.Child
+	}
+	return d.Top
+}
+
+// matches reports whether a locally-stored image digest is current.
+func (d remoteDigestInfo) matches(local string) bool {
+	if local == d.Top {
+		return true
+	}
+	return d.Child != "" && local == d.Child
+}
+
+// resolveRemoteDigest queries the registry for the current digests of the
+// image at fullRef.  For multi-arch indexes it also returns the digest of the
+// platform-specific child manifest matching this host (GOOS/GOARCH), falling
+// back to the first entry if there is no match.  auth provides optional
+// credentials for private registries.
+func (c *ContainerdClient) resolveRemoteDigest(ctx context.Context, fullRef string, auth *types.RegistryAuth) (remoteDigestInfo, error) {
+	// ── Build resolver (authenticated if registry_auth is set) ───────
+	var resolver remotes.Resolver
+	if auth != nil {
+		authResolver, rErr := c.authenticatedResolver(ctx, auth)
+		if rErr != nil {
+			return remoteDigestInfo{}, fmt.Errorf("registry auth for %s: %w", fullRef, rErr)
+		}
+		resolver = authResolver
+	} else {
+		resolver = docker.NewResolver(docker.ResolverOptions{
+			Client: http.DefaultClient,
+		})
+	}
+
+	// Resolve returns the name and descriptor (with digest) from the registry.
+	_, desc, err := resolver.Resolve(ctx, fullRef)
+	if err != nil {
+		return remoteDigestInfo{}, fmt.Errorf("failed to resolve remote image %s: %w", fullRef, err)
+	}
+
+	info := remoteDigestInfo{Top: desc.Digest.String()}
+
+	// Single-platform manifest — there is no child manifest to select.
+	if !isIndexMediaType(desc.MediaType) {
+		return info, nil
+	}
+
+	// Multi-arch index — fetch it and select the child manifest for this host.
+	fetcher, err := resolver.Fetcher(ctx, fullRef)
+	if err != nil {
+		return remoteDigestInfo{}, fmt.Errorf("fetch index for %s: %w", fullRef, err)
+	}
+	content, err := fetcher.Fetch(ctx, desc)
+	if err != nil {
+		return remoteDigestInfo{}, fmt.Errorf("fetch index content for %s: %w", fullRef, err)
+	}
+	defer content.Close()
+
+	raw, err := io.ReadAll(content)
+	if err != nil {
+		return remoteDigestInfo{}, fmt.Errorf("read index for %s: %w", fullRef, err)
+	}
+
+	var idx remoteIndex
+	if err := json.Unmarshal(raw, &idx); err != nil {
+		return remoteDigestInfo{}, fmt.Errorf("parse index for %s: %w", fullRef, err)
+	}
+
+	for _, m := range idx.Manifests {
+		if m.Platform != nil && m.Platform.OS == runtime.GOOS && m.Platform.Architecture == runtime.GOARCH {
+			info.Child = m.Digest
+			return info, nil
+		}
+	}
+	if len(idx.Manifests) > 0 {
+		info.Child = idx.Manifests[0].Digest
+	}
+	return info, nil
+}
+
+// isIndexMediaType reports whether a media type is a multi-arch image index
+// (OCI index or Docker manifest list).
+func isIndexMediaType(mt string) bool {
+	return mt == "application/vnd.oci.image.index.v1+json" ||
+		mt == "application/vnd.docker.distribution.manifest.list.v2+json"
+}
+
+// remoteIndex is the minimal JSON shape of a multi-arch image index.
+type remoteIndex struct {
+	MediaType string `json:"mediaType"`
+	Manifests []struct {
+		MediaType string `json:"mediaType"`
+		Digest    string `json:"digest"`
+		Platform  *struct {
+			Architecture string `json:"architecture"`
+			OS           string `json:"os"`
+		} `json:"platform"`
+	} `json:"manifests"`
+}
+
+// registryCreds is the on-disk format for a registry-credentials secret.
+type registryCreds struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// authenticatedResolver creates a containerd Docker resolver that
+// authenticates with username/password read from the referenced qm secret.
+func (c *ContainerdClient) authenticatedResolver(ctx context.Context, auth *types.RegistryAuth) (remotes.Resolver, error) {
+	if auth == nil || auth.SecretRef == "" || c.secrets == nil {
+		return nil, fmt.Errorf("no registry auth configured")
+	}
+
+	secretData, err := c.secrets.Resolve(auth.SecretRef, auth.SecretRef)
+	if err != nil {
+		return nil, fmt.Errorf("read secret %q: %w", auth.SecretRef, err)
+	}
+
+	var creds registryCreds
+	if err := json.Unmarshal(secretData.Content, &creds); err != nil {
+		return nil, fmt.Errorf("secret %q must be JSON with username and password keys: %w", auth.SecretRef, err)
+	}
+	if creds.Username == "" || creds.Password == "" {
+		return nil, fmt.Errorf("secret %q: username and password are required", auth.SecretRef)
+	}
+
+	// Build an OAuth/Docker token authorizer with basic-auth fallback.
+	authorizer := docker.NewDockerAuthorizer(
+		docker.WithAuthClient(http.DefaultClient),
+		docker.WithAuthCreds(func(host string) (string, string, error) {
+			return creds.Username, creds.Password, nil
+		}),
+	)
+
+	resolver := docker.NewResolver(docker.ResolverOptions{
+		Hosts: docker.ConfigureDefaultRegistries(
+			docker.WithClient(http.DefaultClient),
+			docker.WithAuthorizer(authorizer),
+		),
+	})
+
+	return resolver, nil
 }
 
 // qualifyImageRef adds docker.io/ prefix and :latest tag if missing.
@@ -315,7 +557,36 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 	// ── 1. Add Environment Variables ───────────────────────────────
 	var envVars []string
 	for _, env := range svc.Env {
-		if env.Value != "" {
+		resolved := false
+		if env.ValueFrom != nil {
+			if env.ValueFrom.SecretRef != "" && c.secrets != nil {
+				sd, err := c.secrets.Resolve(env.Name, env.ValueFrom.SecretRef)
+				if err == nil {
+					envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, sd))
+					resolved = true
+					log.Printf("Injected secret %s → env %s for container %s", env.ValueFrom.SecretRef, env.Name, svc.Name)
+				} else {
+					log.Printf("Warning: failed to resolve secret %s for %s: %v", env.ValueFrom.SecretRef, svc.Name, err)
+				}
+			}
+
+			if !resolved && env.ValueFrom.ConfigMapRef != "" && c.configMgr != nil {
+				key := env.ValueFrom.Key
+				if key == "" {
+					key = env.Name
+				}
+				val, err := c.configMgr.ResolveConfigMap(env.ValueFrom.ConfigMapRef, key)
+				if err == nil {
+					envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, val))
+					resolved = true
+					log.Printf("ConfigMap %s/%s → env %s=%s for container %s", env.ValueFrom.ConfigMapRef, key, env.Name, val, svc.Name)
+				} else {
+					log.Printf("ConfigMap %s/%s not resolved for %s: %v", env.ValueFrom.ConfigMapRef, key, svc.Name, err)
+				}
+			}
+		}
+
+		if !resolved && env.Value != "" {
 			envVars = append(envVars, fmt.Sprintf("%s=%s", env.Name, env.Value))
 		}
 	}
@@ -323,16 +594,43 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 		specOpts = append(specOpts, oci.WithEnv(envVars))
 	}
 
+	// Mount cleanups — declared early so configmap volumes can reference them.
+	var secretCleanup func()
+	var configMapCleanups []func()
+
 	// ── 2. Add Volume Mounts ───────────────────────────────────────
 	for _, vol := range svc.Volumes {
-		specOpts = append(specOpts, oci.WithMounts([]specs.Mount{
-			{
-				Type:        vol.Type,
-				Source:      vol.Source,
-				Destination: vol.Target,
-				Options:     []string{"bind", "rw"},
-			},
-		}))
+		if vol.Type == "configmap" && vol.ConfigMap != nil && c.configMgr != nil {
+			mountDir, cleanup, err := c.prepareConfigMapMount(vol)
+			if err != nil {
+				if secretCleanup != nil {
+					secretCleanup()
+				}
+				for _, c := range configMapCleanups {
+					c()
+				}
+				return "", fmt.Errorf("configmap volume %s: %w", vol.ConfigMap.Name, err)
+			}
+			configMapCleanups = append(configMapCleanups, cleanup)
+
+			specOpts = append(specOpts, oci.WithMounts([]specs.Mount{
+				{
+					Type:        "bind",
+					Source:      mountDir,
+					Destination: vol.Target,
+					Options:     []string{"bind", "ro"},
+				},
+			}))
+		} else {
+			specOpts = append(specOpts, oci.WithMounts([]specs.Mount{
+				{
+					Type:        vol.Type,
+					Source:      vol.Source,
+					Destination: vol.Target,
+					Options:     []string{"bind", "rw"},
+				},
+			}))
+		}
 	}
 
 	// ── 3. Set User ────────────────────────────────────────────────
@@ -341,7 +639,6 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 	}
 
 	// ── 4. Inject Secrets ──────────────────────────────────────────
-	var secretCleanup func()
 	if c.secrets != nil && len(svc.Secrets) > 0 {
 		secretRefs := make([]secrets.SecretRef, len(svc.Secrets))
 		for i, s := range svc.Secrets {
@@ -349,6 +646,9 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 		}
 		mountDir, cleanup, err := c.secrets.PrepareMountDir(secretRefs)
 		if err != nil {
+			for _, c := range configMapCleanups {
+				c()
+			}
 			return "", fmt.Errorf("failed to prepare secrets for %s: %w", svc.Name, err)
 		}
 		secretCleanup = cleanup // stored after container creation succeeds
@@ -470,12 +770,22 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 		if secretCleanup != nil {
 			secretCleanup()
 		}
+		for _, cleanup := range configMapCleanups {
+			cleanup()
+		}
 		return "", fmt.Errorf("failed to create container %s: %w", svc.Name, err)
 	}
 
-	// Store secret mount cleanup for when the container is deleted.
-	if secretCleanup != nil {
-		c.mountCleanups[container.ID()] = secretCleanup
+	// Store secret and configmap mount cleanups for when the container is deleted.
+	if secretCleanup != nil || len(configMapCleanups) > 0 {
+		c.mountCleanups[container.ID()] = func() {
+			if secretCleanup != nil {
+				secretCleanup()
+			}
+			for _, cleanup := range configMapCleanups {
+				cleanup()
+			}
+		}
 	}
 
 	return container.ID(), nil
@@ -500,6 +810,32 @@ func resolveVPNGateway(nm network.NetManager, netProfile string, dependsOn []str
 }
 
 // StartContainer starts a task for the container.
+// prepareConfigMapMount creates a temporary directory containing all keys
+// from a ConfigMap as individual files, and returns the directory path along
+// with a cleanup function that removes it.
+func (c *ContainerdClient) prepareConfigMapMount(vol types.Volume) (string, func(), error) {
+	data, err := c.configMgr.ListConfigMapKeys(vol.ConfigMap.Name)
+	if err != nil {
+		return "", nil, fmt.Errorf("configmap %q: %w", vol.ConfigMap.Name, err)
+	}
+
+	dir, err := os.MkdirTemp("", "quartermaster-configmap-")
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create configmap tmp dir: %w", err)
+	}
+
+	cleanup := func() { os.RemoveAll(dir) }
+
+	for key, value := range data {
+		if err := os.WriteFile(filepath.Join(dir, key), []byte(value), 0444); err != nil {
+			cleanup()
+			return "", nil, fmt.Errorf("failed to write configmap key %q: %w", key, err)
+		}
+	}
+
+	return dir, cleanup, nil
+}
+
 func (c *ContainerdClient) StartContainer(ctx context.Context, containerID string) error {
 	ctx = c.withNamespace(ctx)
 	log.Printf("Starting container: %s", containerID)

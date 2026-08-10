@@ -2,7 +2,29 @@
 
 All notable changes to Quartermaster.
 
-## [Unreleased]
+## [0.6.0] - 2026-07-07
+
+### Added
+- Scheduled restarts (`restart_at`) with time, frequency, and update policy
+- `update_policy: latest` — checks OCI registry for newer image before restarting
+- Rolling updates (`rolling_update: true`) — zero-downtime deploys with inline health probes
+- Authenticated registry pulls (`registry_auth`) via QM secrets (NaCl-encrypted JSON)
+- `CheckImageUpdate` CRI method — OCI manifest digest comparison via docker.NewResolver
+- `RestartService` reconciler method — rolling or stop-delete-recreate
+- `runRollingUpdateFlow` — create replacement → health-check → kill old
+- Live HTML dashboard (`/v1/dashboard`) — auto-refreshing status page
+- `qm-test` binary — self-contained setup/verify/test harness
+- Release workflow (`.github/workflows/release.yml`) — builds qm, qm-daemon, qm-test on v* tags
+
+### Changed
+- VictoriaMetrics component now auto-generates scrape config on first start (inline shell script)
+- Grafana component now auto-provisions datasource + dashboard on first start
+- VPN component switched to file-based secrets (`SECRETFILE` env vars)
+- Media-stack component: qbittorrent → sabnzbd, +flaresolverr, +jellyseerr, generic defaults
+- Dashboard component: `:latest` image, directory socket mount, healthcheck
+- Components repo is now generic (no server-specific config) — overrides in private config repo
+
+## [0.5.0] - 2026-05-29
 
 ### Added
 - Prometheus/VictoriaMetrics-compatible metrics endpoint (`/v1/metrics`)

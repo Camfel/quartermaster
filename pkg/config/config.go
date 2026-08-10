@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 
 	"quartermaster/pkg/types"
 
@@ -17,11 +18,16 @@ import (
 )
 
 // ConfigManager handles loading and validating configurations.
-type ConfigManager struct{}
+type ConfigManager struct {
+	mu         sync.RWMutex
+	configMaps map[string]*types.ConfigMap
+}
 
 // NewConfigManager creates a new instance of ConfigManager.
 func NewConfigManager() *ConfigManager {
-	return &ConfigManager{}
+	return &ConfigManager{
+		configMaps: make(map[string]*types.ConfigMap),
+	}
 }
 
 // LoadStack reads a YAML file from the given path and unmarshals it into a Stack.
@@ -68,10 +74,79 @@ func (cm *ConfigManager) SaveStack(path string, stack *types.Stack) error {
 	return nil
 }
 
+// ── ConfigMap operations ─────────────────────────────────────────────
+
+// LoadConfigMap reads a ConfigMap YAML file and registers it by name.
+func (cm *ConfigManager) LoadConfigMap(path string) (*types.ConfigMap, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read configmap file: %w", err)
+	}
+
+	var cmap types.ConfigMap
+	if err := yaml.Unmarshal(data, &cmap); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal configmap: %w", err)
+	}
+
+	if cmap.Kind != "ConfigMap" {
+		return nil, fmt.Errorf("expected kind ConfigMap, got %q", cmap.Kind)
+	}
+	if cmap.Metadata.Name == "" {
+		return nil, fmt.Errorf("configmap metadata.name is required")
+	}
+
+	cm.RegisterConfigMap(&cmap)
+	return &cmap, nil
+}
+
+// RegisterConfigMap adds a ConfigMap to the registry directly.
+func (cm *ConfigManager) RegisterConfigMap(cmap *types.ConfigMap) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.configMaps[cmap.Metadata.Name] = cmap
+}
+
+// ResolveConfigMap looks up a key in a registered ConfigMap.
+func (cm *ConfigManager) ResolveConfigMap(name, key string) (string, error) {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	cmap, ok := cm.configMaps[name]
+	if !ok {
+		return "", fmt.Errorf("configmap %q not found", name)
+	}
+	val, ok := cmap.Data[key]
+	if !ok {
+		return "", fmt.Errorf("key %q not found in configmap %q", key, name)
+	}
+	return val, nil
+}
+
+// ListConfigMapKeys returns all key-value pairs in a registered ConfigMap.
+func (cm *ConfigManager) ListConfigMapKeys(name string) (map[string]string, error) {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	cmap, ok := cm.configMaps[name]
+	if !ok {
+		return nil, fmt.Errorf("configmap %q not found", name)
+	}
+	return cmap.Data, nil
+}
+
 // MergeStacks combines two stacks into one. Services from the second stack
 // are appended to the first.  The first stack's metadata is preserved.
 // Duplicate service names: the first stack wins.
 func (cm *ConfigManager) MergeStacks(base, additional *types.Stack) *types.Stack {
+	// Later stacks win on service name conflicts.  StackFiles() orders
+	// component stacks first and user repos last, so repo overrides must
+	// replace (not be dropped by) component defaults.
+	for i := range base.Spec.Services {
+		for _, svc := range additional.Spec.Services {
+			if svc.Name == base.Spec.Services[i].Name {
+				base.Spec.Services[i] = svc
+				break
+			}
+		}
+	}
 	seen := make(map[string]bool, len(base.Spec.Services))
 	for _, svc := range base.Spec.Services {
 		seen[svc.Name] = true
@@ -96,10 +171,11 @@ var validRestartPolicies = map[string]bool{
 
 // validVolumeTypes defines the allowed volume type values.
 var validVolumeTypes = map[string]bool{
-	"bind":   true,
-	"volume": true,
-	"tmpfs":  true,
-	"":       true, // empty defaults to "bind"
+	"bind":      true,
+	"volume":    true,
+	"tmpfs":     true,
+	"configmap": true,
+	"":          true, // empty defaults to "bind"
 }
 
 // validHealthCheckTypes defines the allowed health check probe types.
@@ -185,14 +261,18 @@ func (cm *ConfigManager) validate(stack *types.Stack) error {
 
 		// Volume validation
 		for _, vol := range svc.Volumes {
-			if vol.Source == "" {
+			if vol.Type == "configmap" {
+				if vol.ConfigMap == nil || vol.ConfigMap.Name == "" {
+					return fmt.Errorf("service %q: configmap volume requires configMap.name", svc.Name)
+				}
+			} else if vol.Source == "" {
 				return fmt.Errorf("service %q: volume source is required", svc.Name)
 			}
 			if vol.Target == "" {
 				return fmt.Errorf("service %q: volume target is required", svc.Name)
 			}
 			if !validVolumeTypes[vol.Type] {
-				return fmt.Errorf("service %q: invalid volume type %q (must be one of: bind, volume, tmpfs)", svc.Name, vol.Type)
+				return fmt.Errorf("service %q: invalid volume type %q (must be one of: bind, volume, tmpfs, configmap)", svc.Name, vol.Type)
 			}
 		}
 

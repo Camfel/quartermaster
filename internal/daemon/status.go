@@ -97,6 +97,16 @@ func startAPI(socketPath string, status *Status, reloadCh chan struct{}, reconci
 		json.NewEncoder(w).Encode(s)
 	})
 
+	// /v1/dashboard — live HTML status page (auto-refreshing)
+	mux.HandleFunc("/v1/dashboard", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(dashboardHTML))
+	})
+
 	// /v1/metrics — Prometheus-compatible metrics (VictoriaMetrics, etc.)
 	if metricsHandler != nil {
 		mux.Handle("/v1/metrics", metricsHandler)
@@ -215,6 +225,9 @@ func startAPI(socketPath string, status *Status, reloadCh chan struct{}, reconci
 					Resources     *types.Resources     `json:"resources,omitempty"`
 					Command       []string             `json:"command,omitempty"`
 					Ingress       *types.IngressConfig `json:"ingress,omitempty"`
+					RegistryAuth  *types.RegistryAuth  `json:"registry_auth,omitempty"`
+					RestartAt     *types.RestartAt     `json:"restart_at,omitempty"`
+					RollingUpdate bool                 `json:"rolling_update,omitempty"`
 					// Runtime fields (from container snapshot).
 					Running bool   `json:"running"`
 					PID     uint32 `json:"pid,omitempty"`
@@ -232,6 +245,9 @@ func startAPI(socketPath string, status *Status, reloadCh chan struct{}, reconci
 					DependsOn:     svc.DependsOn,
 					Command:       svc.Command,
 					Ingress:       svc.Ingress,
+					RegistryAuth:  svc.RegistryAuth,
+					RestartAt:     svc.RestartAt,
+					RollingUpdate: svc.RollingUpdate,
 				}
 				if svc.HealthCheck != nil {
 					resp.HealthCheck = svc.HealthCheck
@@ -333,6 +349,114 @@ func recordContainers(status *Status, containers []cri.ContainerInfo, stack *typ
 	}
 	status.Containers = out
 }
+
+// dashboardHTML is a self-contained single-page dashboard that polls
+// /v1/status every 3 seconds and renders a live status table.
+const dashboardHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Quartermaster Dashboard</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+  .header{background:#1e293b;padding:16px 24px;display:flex;align-items:center;justify-content:space-between;border-bottom:2px solid #334155}
+  .header h1{font-size:20px;font-weight:600}
+  .header .info{font-size:13px;color:#94a3b8}
+  .header .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+  .dot.green{background:#22c55e}
+  .dot.red{background:#ef4444}
+  .container{max-width:1100px;margin:0 auto;padding:24px}
+  .card{background:#1e293b;border-radius:8px;margin-bottom:12px;overflow:hidden;border:1px solid #334155}
+  .card-header{display:flex;align-items:center;padding:12px 16px;gap:12px;border-bottom:1px solid #334155}
+  .card-header .name{font-weight:600;font-size:15px}
+  .card-header .image{font-size:13px;color:#94a3b8;font-family:monospace}
+  .status-badge{padding:2px 8px;border-radius:4px;font-size:12px;font-weight:600;margin-left:auto}
+  .badge-up{background:#064e3b;color:#34d399}
+  .badge-down{background:#450a0a;color:#f87171}
+  .card-body{padding:12px 16px;display:flex;gap:20px;flex-wrap:wrap;font-size:13px}
+  .card-body .field{display:flex;gap:6px}
+  .field-label{color:#64748b}
+  .field-value{color:#e2e8f0;font-family:monospace}
+  .health-ok{color:#22c55e}
+  .health-fail{color:#ef4444}
+  .health-unknown{color:#64748b}
+  .empty{padding:40px;text-align:center;color:#64748b}
+  .footer{padding:16px 24px;font-size:12px;color:#475569;text-align:center}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+  .loading{animation:pulse 1.5s infinite}
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <h1>Quartermaster Dashboard</h1>
+    <div class="info" id="headerInfo">connecting...</div>
+  </div>
+  <div class="info" id="refreshInfo"></div>
+</div>
+<div class="container" id="container">
+  <div class="empty loading">Connecting to daemon...</div>
+</div>
+<div class="footer">Quartermaster — lightweight container orchestrator</div>
+<script>
+function fmtDuration(secs){
+  if(!secs||secs<0)return'-';
+  var d=Math.floor(secs/86400),h=Math.floor((secs%86400)/3600),m=Math.floor((secs%3600)/60),s=Math.floor(secs%60);
+  var p=[];if(d>0)p.push(d+'d');if(h>0)p.push(h+'h');if(m>0)p.push(m+'m');p.push(s+'s');return p.join(' ');
+}
+function icon(b){return b?'&#x2713;':'&#x2717;'}
+function refresh(){
+  var x=new XMLHttpRequest();
+  x.open('GET','/v1/status',true);
+  x.onload=function(){
+    if(x.status!==200){document.getElementById('container').innerHTML='<div class="empty">API error: '+x.status+'</div>';return}
+    var s=JSON.parse(x.responseText);
+    document.getElementById('headerInfo').innerHTML='<span class="dot green"></span>connected &middot; uptime '+s.uptime+' &middot; '+s.reconcile_count+' reconcile(s)';
+    if(s.last_reconcile_error){
+      document.getElementById('headerInfo').innerHTML+='<br><span style="color:#f87171">&#9888; '+s.last_reconcile_error+'</span>';
+    }
+    document.getElementById('refreshInfo').textContent='last refresh: '+new Date().toLocaleTimeString();
+    var cs=s.containers||[];
+    if(cs.length===0){
+      document.getElementById('container').innerHTML='<div class="empty">No containers managed yet. Add a stack to get started.</div>';
+      return;
+    }
+    var html='';
+    for(var i=0;i<cs.length;i++){
+      var c=cs[i];
+      var badge=c.running?'<span class="status-badge badge-up">RUNNING</span>':'<span class="status-badge badge-down">DOWN</span>';
+      var health='<span class="health-unknown">-</span>';
+      if(c.healthy===true)health='<span class="health-ok">&#x2713; healthy</span>';
+      else if(c.healthy===false)health='<span class="health-fail">&#x2717; unhealthy</span>';
+      var ports=c.ports&&c.ports.length?c.ports.join(', '):'-';
+      var net=c.network||'-';
+      var img=c.image||'';
+      html+='<div class="card">'+
+        '<div class="card-header">'+
+          '<span class="name">'+c.name+'</span>'+
+          '<span class="image">'+img+'</span>'+
+          badge+
+        '</div>'+
+        '<div class="card-body">'+
+          '<div class="field"><span class="field-label">Network:</span><span class="field-value">'+net+'</span></div>'+
+          '<div class="field"><span class="field-label">Ports:</span><span class="field-value">'+ports+'</span></div>'+
+          '<div class="field"><span class="field-label">Health:</span>'+health+'</div>'+
+          '<div class="field"><span class="field-label">PID:</span><span class="field-value">'+(c.pid||'-')+'</span></div>'+
+        '</div>'+
+      '</div>';
+    }
+    document.getElementById('container').innerHTML=html;
+  };
+  x.onerror=function(){document.getElementById('container').innerHTML='<div class="empty">Cannot reach daemon</div>'}
+  x.send();
+}
+refresh();setInterval(refresh,3000);
+</script>
+</body>
+</html>
+`
 
 // formatPorts returns a human-readable list of port mappings for a service.
 func formatPorts(svc types.Service) []string {

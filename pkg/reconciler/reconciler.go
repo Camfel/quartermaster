@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
+	"time"
 
 	"quartermaster/pkg/config"
 	"quartermaster/pkg/cri"
@@ -158,6 +160,15 @@ func (r *Reconciler) ReconcileStack(ctx context.Context, stack *types.Stack) err
 						log.Printf("Warning: failed to update gateway route for %s: %v", gwName, err)
 					}
 
+					// Refresh this container's netns policy route (table 100)
+					// so its egress points at the live gateway — the host-side
+					// fwmark route alone leaves the per-netns default pointing
+					// at the dead gateway (EHOSTUNREACH).
+					short := network.ShortName(svc.Name)
+					if err := r.netMgr.UpdateVPNRoute("qm-"+short, newIP.String(), "veth-c-"+short); err != nil {
+						log.Printf("Warning: failed to update VPN route for %s: %v", svc.Name, err)
+					}
+
 					// Re-apply the gateway's FORWARD + MASQUERADE rules (handled
 					// async by ConfigureVPNGateway — already triggered on gateway restart)
 
@@ -218,7 +229,7 @@ func (r *Reconciler) runCreateFlow(ctx context.Context, svc types.Service, runni
 	}
 
 	// 1. Pull Image
-	fullImage, err := r.containerClient.PullImage(ctx, svc.Image)
+	fullImage, err := r.containerClient.PullImage(ctx, svc.Image, svc.RegistryAuth)
 	if err != nil {
 		return "", fmt.Errorf("pull failed: %w", err)
 	}
@@ -260,13 +271,141 @@ func (r *Reconciler) runDeleteFlow(ctx context.Context, containerID, name string
 }
 
 // runUpdateFlow stops and deletes the old container, then creates a new one.
+// When svc.RollingUpdate is true the new container is created and health-checked
+// first, avoiding downtime.
 func (r *Reconciler) runUpdateFlow(ctx context.Context, oldContainerID string, svc types.Service) error {
+	if svc.RollingUpdate {
+		return r.runRollingUpdateFlow(ctx, oldContainerID, svc)
+	}
+
 	log.Printf("Updating service %s: removing old container %s", svc.Name, oldContainerID)
 
 	if err := r.runDeleteFlow(ctx, oldContainerID, svc.Name); err != nil {
 		return fmt.Errorf("failed to delete old container: %w", err)
 	}
 
+	_, err := r.runCreateFlow(ctx, svc, nil, nil)
+	return err
+}
+
+// runRollingUpdateFlow creates a new container, waits for it to become healthy,
+// then gracefully stops and deletes the old container — zero-downtime deploys.
+func (r *Reconciler) runRollingUpdateFlow(ctx context.Context, oldContainerID string, svc types.Service) error {
+	log.Printf("Rolling update for %s: creating replacement before stopping old container %s",
+		svc.Name, oldContainerID)
+
+	// ── 1. Create and start the replacement ──────────────────────────
+	newID, err := r.runCreateFlow(ctx, svc, nil, nil)
+	if err != nil {
+		return fmt.Errorf("rolling update: failed to create replacement for %s: %w", svc.Name, err)
+	}
+	log.Printf("Rolling update: replacement %s (%s) created — waiting for health check", svc.Name, newID)
+
+	// ── 2. Wait for new container to pass health check ────────────────
+	healthy := r.waitForHealthy(ctx, newID, svc)
+	if !healthy {
+		log.Printf("Rolling update for %s: replacement did not pass health check — cleaning up", svc.Name)
+		if delErr := r.containerClient.DeleteContainer(ctx, newID); delErr != nil {
+			log.Printf("Warning: cleanup of failed replacement %s failed: %v", newID, delErr)
+		}
+		// Detach any network resources allocated for the failed container.
+		if r.netMgr != nil {
+			r.netMgr.Detach(svc.Name, string(network.NormaliseProfile(svc.Network)))
+		}
+		return fmt.Errorf("rolling update: replacement container %s did not become healthy — keeping old container", svc.Name)
+	}
+
+	// ── 3. Graceful shutdown of old container ─────────────────────────
+	log.Printf("Rolling update: replacement %s is healthy — stopping old container %s", svc.Name, oldContainerID)
+	if err := r.containerClient.StopContainer(ctx, oldContainerID); err != nil {
+		log.Printf("Warning: stop of old container %s failed: %v", oldContainerID, err)
+	}
+
+	// ── 4. Clean up old container and its network resources ───────────
+	if err := r.runDeleteFlow(ctx, oldContainerID, svc.Name); err != nil {
+		log.Printf("Warning: delete of old container %s failed: %v (replacement is running)", oldContainerID, err)
+	}
+
+	log.Printf("Rolling update for %s complete: %s replaces %s", svc.Name, newID, oldContainerID)
+	return nil
+}
+
+// waitForHealthy polls the container until its health check passes or a
+// timeout is reached.  Returns true if healthy, false on timeout or error.
+func (r *Reconciler) waitForHealthy(ctx context.Context, containerID string, svc types.Service) bool {
+	if svc.HealthCheck == nil {
+		// No health check configured — give the container a startup grace
+		// period (3s) then assume it's healthy.
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(3 * time.Second):
+		}
+		return true
+	}
+
+	// Parse the configured interval.
+	checkInterval, err := time.ParseDuration(svc.HealthCheck.Interval)
+	if err != nil || checkInterval <= 0 {
+		checkInterval = 5 * time.Second
+	}
+
+	// Resolve the bridge IP of the new container.
+	var bridgeIP string
+	if r.netMgr != nil {
+		if ip := r.netMgr.LookupIP(svc.Name); ip != nil {
+			bridgeIP = ip.String()
+		}
+	}
+
+	// Give the container time to start; first check after the interval.
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(2 * time.Second):
+	}
+
+	maxWait := 60 * time.Second
+	deadline := time.After(maxWait)
+
+	for {
+		// Quick check: is the container's task still running?
+		pid, pidErr := r.containerClient.GetContainerPID(ctx, containerID)
+		if pidErr != nil || pid == 0 {
+			log.Printf("Rolling update health check for %s: container is not running", svc.Name)
+			return false
+		}
+
+		// Perform the actual health probe.
+		result := probeHealth(svc, bridgeIP)
+		if result {
+			return true
+		}
+
+		select {
+		case <-ctx.Done():
+			return false
+		case <-deadline:
+			log.Printf("Rolling update health check for %s: timed out after %v", svc.Name, maxWait)
+			return false
+		case <-time.After(checkInterval):
+			// continue polling
+		}
+	}
+}
+
+// RestartService stops and redeploys a single service, pulling the latest
+// image.  If the service has RollingUpdate enabled the replacement is created
+// before the old container is stopped.
+func (r *Reconciler) RestartService(ctx context.Context, svc types.Service, oldContainerID string) error {
+	if svc.RollingUpdate {
+		return r.runRollingUpdateFlow(ctx, oldContainerID, svc)
+	}
+
+	log.Printf("Restarting service %s (stop-delete-recreate)", svc.Name)
+	if err := r.runDeleteFlow(ctx, oldContainerID, svc.Name); err != nil {
+		return fmt.Errorf("restart %s: delete old container: %w", svc.Name, err)
+	}
 	_, err := r.runCreateFlow(ctx, svc, nil, nil)
 	return err
 }
@@ -378,6 +517,54 @@ func (r *Reconciler) regenerateIngress(desiredMap map[string]types.Service) {
 	}
 	if err := ingress.ReloadCaddy(); err != nil {
 		log.Printf("Warning: caddy reload failed: %v", err)
+	}
+}
+
+// probeHealth performs a lightweight inline health check against a container.
+// Returns true if the probe succeeds, false otherwise.
+func probeHealth(svc types.Service, bridgeIP string) bool {
+	if svc.HealthCheck == nil {
+		return true
+	}
+
+	hc := svc.HealthCheck
+	port := hc.Port
+	if port == 0 && len(svc.Ports) > 0 {
+		// Use the first container port if no explicit health-check port.
+		port = svc.Ports[0].Container
+	}
+	if port == 0 {
+		return true // nothing to probe
+	}
+
+	addr := bridgeIP
+	if addr == "" {
+		addr = "127.0.0.1"
+	}
+	target := net.JoinHostPort(addr, fmt.Sprintf("%d", port))
+
+	switch {
+	case hc.Type == "http" || hc.Type == "https":
+		scheme := "http"
+		if hc.Type == "https" {
+			scheme = "https"
+		}
+		url := fmt.Sprintf("%s://%s%s", scheme, target, hc.Path)
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Get(url)
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode >= 200 && resp.StatusCode < 400
+	default:
+		// TCP connect probe.
+		conn, err := net.DialTimeout("tcp", target, 3*time.Second)
+		if err != nil {
+			return false
+		}
+		conn.Close()
+		return true
 	}
 }
 
