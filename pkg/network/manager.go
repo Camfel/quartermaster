@@ -124,6 +124,14 @@ type NetManager interface {
 	// route in table 100 is updated; no container recreates are needed.
 	UpdateGatewayRoute(gatewayIP string) error
 
+	// UpdateVPNRoute replaces the default route in a VPN-routed container's
+	// netns policy table (table 100) when the VPN gateway's bridge IP
+	// changes.  UpdateGatewayRoute fixes the host-side fwmark route; this
+	// keeps each container's source-based egress pointing at the live
+	// gateway so traffic doesn't die with EHOSTUNREACH after a gluetun
+	// recreate.
+	UpdateVPNRoute(nsName, gatewayIP, ctrVeth string) error
+
 	// RecoverVPNRouting re-applies fwmark-based VPN routing for all existing
 	// containers after a daemon restart.  Called during recovery to ensure
 	// the mangle mark rules and host-level fwmark infrastructure are present

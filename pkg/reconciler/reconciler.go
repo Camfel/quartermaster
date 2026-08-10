@@ -160,6 +160,15 @@ func (r *Reconciler) ReconcileStack(ctx context.Context, stack *types.Stack) err
 						log.Printf("Warning: failed to update gateway route for %s: %v", gwName, err)
 					}
 
+					// Refresh this container's netns policy route (table 100)
+					// so its egress points at the live gateway — the host-side
+					// fwmark route alone leaves the per-netns default pointing
+					// at the dead gateway (EHOSTUNREACH).
+					short := network.ShortName(svc.Name)
+					if err := r.netMgr.UpdateVPNRoute("qm-"+short, newIP.String(), "veth-c-"+short); err != nil {
+						log.Printf("Warning: failed to update VPN route for %s: %v", svc.Name, err)
+					}
+
 					// Re-apply the gateway's FORWARD + MASQUERADE rules (handled
 					// async by ConfigureVPNGateway — already triggered on gateway restart)
 

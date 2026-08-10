@@ -1008,6 +1008,43 @@ func (b *BridgeManager) UpdateGatewayRoute(gatewayIP string) error {
 	return nil
 }
 
+// UpdateVPNRoute implements NetManager.  Replaces the default route in a
+// container netns's policy table (table 100) when the VPN gateway's bridge
+// IP changes.  The host-side fwmark route is handled by UpdateGatewayRoute;
+// this keeps the container's source-based egress pointing at the live
+// gateway so traffic doesn't die with EHOSTUNREACH after a gluetun
+// recreate.  The LinkIndex is required — without it the kernel can reject
+// the route when the gateway isn't directly attached to the interface.
+func (b *BridgeManager) UpdateVPNRoute(nsName, gatewayIP, ctrVeth string) error {
+	gw := net.ParseIP(gatewayIP)
+	if gw == nil {
+		return fmt.Errorf("invalid gateway IP %q", gatewayIP)
+	}
+
+	handle, err := getHandle(nsName)
+	if err != nil {
+		return fmt.Errorf("open netns %s for VPN route update: %w", nsName, err)
+	}
+	defer handle.Delete()
+
+	ctrLink, err := handle.LinkByName(ctrVeth)
+	if err != nil {
+		return fmt.Errorf("find %s in ns %s: %w", ctrVeth, nsName, err)
+	}
+
+	route := &netlink.Route{
+		LinkIndex: ctrLink.Attrs().Index,
+		Dst:       &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)},
+		Gw:        gw,
+		Table:     vpnRouteTable,
+	}
+	if err := handle.RouteReplace(route); err != nil {
+		return fmt.Errorf("replace default route in table %d: %w", vpnRouteTable, err)
+	}
+	log.Printf("VPN routing: updated %s → table %d via %s", ctrVeth, vpnRouteTable, gatewayIP)
+	return nil
+}
+
 // ── Namespace-scoped netlink helpers ────────────────────────────────────
 
 // getHandle returns a netlink.Handle bound to a named network namespace.
