@@ -298,6 +298,9 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 			}
 		}
 		recordReconcile(d.status, err)
+		if d.metrics != nil {
+			d.metrics.SetLKGHealthy(d.status.LKGHealthy)
+		}
 		return err
 	}
 
@@ -308,6 +311,9 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 	}
 	d.status.LKGHealthy = true
 	d.status.LKGError = ""
+	if d.metrics != nil {
+		d.metrics.SetLKGHealthy(true)
+	}
 
 	recordReconcile(d.status, nil)
 
