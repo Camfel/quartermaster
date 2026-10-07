@@ -82,7 +82,7 @@ func (c *Checker) RunCheck(svc types.Service, bridgeIP string) Result {
 // checkHTTP performs an HTTP GET request against the container's health endpoint.
 func (c *Checker) checkHTTP(svc types.Service, bridgeIP string) error {
 	hc := svc.HealthCheck
-	port := resolvePort(svc, hc)
+	port := resolvePort(svc, hc, bridgeIP)
 	host := "localhost"
 	if bridgeIP != "" {
 		host = bridgeIP
@@ -105,7 +105,7 @@ func (c *Checker) checkHTTP(svc types.Service, bridgeIP string) error {
 // checkTCP attempts a TCP connection to the container's port.
 func (c *Checker) checkTCP(svc types.Service, bridgeIP string) error {
 	hc := svc.HealthCheck
-	port := resolvePort(svc, hc)
+	port := resolvePort(svc, hc, bridgeIP)
 	host := "localhost"
 	if bridgeIP != "" {
 		host = bridgeIP
@@ -120,13 +120,21 @@ func (c *Checker) checkTCP(svc types.Service, bridgeIP string) error {
 	return nil
 }
 
-// resolvePort returns the port to use for health checks.
-// Priority: healthcheck port > first host-mapped port > 80.
-func resolvePort(svc types.Service, hc *types.HealthCheck) int {
+// resolvePort returns the port to probe.
+//
+//   - An explicit healthcheck port always wins (it is the container's port).
+//   - For bridge-networked services (bridgeIP set) the probe targets the
+//     container's own netns, so the container port is used.
+//   - For host-networked services (bridgeIP empty) the container shares the
+//     host netns and is reached on the published host port.
+func resolvePort(svc types.Service, hc *types.HealthCheck, bridgeIP string) int {
 	if hc.Port > 0 {
 		return hc.Port
 	}
 	if len(svc.Ports) > 0 {
+		if bridgeIP != "" {
+			return svc.Ports[0].Container
+		}
 		return svc.Ports[0].Host
 	}
 	return 80
