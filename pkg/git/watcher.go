@@ -64,7 +64,7 @@ func (w *Watcher) RepoURL() string { return w.repoURL }
 func (w *Watcher) Start(ctx context.Context) error {
 	log.Printf("Starting Git watcher for %s (branch: %s)", sanitiseURL(w.repoURL), w.branch)
 
-	repo, err := w.ensureRepo(ctx)
+	repo, err := w.ensureRepoWithRetry(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to ensure repository: %w", err)
 	}
@@ -91,24 +91,65 @@ func (w *Watcher) Start(ctx context.Context) error {
 				continue
 			}
 
-			if newHash != "" && newHash != lastHash {
-				log.Printf("New commit detected: %s (was %s)", newHash, lastHash)
-				lastHash = newHash
+			if newHash == "" || newHash == lastHash {
+				continue
+			}
 
-				if err := w.checkout(repo); err != nil {
-					log.Printf("Error updating working tree: %v", err)
-					continue
-				}
+			// Cooldown: leave lastHash untouched and defer, so the commit is
+			// retried on the next tick instead of being silently dropped.
+			if w.cooldown > 0 && time.Since(w.lastTrigger) < w.cooldown {
+				log.Printf("Deferring trigger for %s: cooldown (last trigger %v ago)", newHash, time.Since(w.lastTrigger))
+				continue
+			}
 
-				if w.cooldown > 0 && time.Since(w.lastTrigger) < w.cooldown {
-					log.Printf("Skipping trigger: cooldown (last: %v ago)", time.Since(w.lastTrigger))
-					continue
-				}
+			log.Printf("New commit detected: %s (was %s)", newHash, lastHash)
+			if err := w.checkout(repo); err != nil {
+				log.Printf("Error updating working tree: %v", err)
+				continue
+			}
+			// Only advance once the working tree is in sync, otherwise a failed
+			// checkout would permanently skip the commit.
+			lastHash = newHash
 
-				if w.onChanged != nil {
-					w.lastTrigger = time.Now()
-					w.onChanged(ctx, newHash)
-				}
+			if w.onChanged != nil {
+				w.lastTrigger = time.Now()
+				w.onChanged(ctx, newHash)
+			}
+		}
+	}
+}
+
+// Retry backoff for the initial clone/open.  Variables so tests can shrink
+// them.
+var (
+	initialRetryDelay = 5 * time.Second
+	maxRetryDelay     = 1 * time.Minute
+)
+
+// ensureRepoWithRetry keeps trying to open or clone the repository until it
+// succeeds or ctx is cancelled.  A transient network failure at startup used
+// to kill the watcher permanently, leaving the repo unmonitored until a daemon
+// restart.
+func (w *Watcher) ensureRepoWithRetry(ctx context.Context) (*git.Repository, error) {
+	delay := initialRetryDelay
+	for {
+		repo, err := w.ensureRepo(ctx)
+		if err == nil {
+			return repo, nil
+		}
+		log.Printf("Git watcher for %s: initial setup failed: %v — retrying in %v",
+			sanitiseURL(w.repoURL), err, delay)
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+
+		if delay < maxRetryDelay {
+			delay *= 2
+			if delay > maxRetryDelay {
+				delay = maxRetryDelay
 			}
 		}
 	}

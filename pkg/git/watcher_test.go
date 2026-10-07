@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -116,5 +117,39 @@ func TestWatcher_Start(t *testing.T) {
 	err = <-errChan
 	if err != nil && err != context.Canceled {
 		t.Errorf("watcher exited with error: %v", err)
+	}
+}
+
+func TestWatcher_StartRetriesUntilCancelled(t *testing.T) {
+	oldInitial, oldMax := initialRetryDelay, maxRetryDelay
+	initialRetryDelay, maxRetryDelay = 10*time.Millisecond, 20*time.Millisecond
+	defer func() { initialRetryDelay, maxRetryDelay = oldInitial, oldMax }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	w := NewWatcher(
+		"file:///nonexistent/quartermaster-retry-test",
+		"main",
+		"", "", "",
+		t.TempDir(),
+		time.Hour,
+		0,
+		nil,
+	)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- w.Start(ctx) }()
+
+	// Let the initial clone fail a few times, then cancel.  If Start returned
+	// the clone error instead of retrying, it would land in errCh early.
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled after cancellation, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher did not stop after cancellation")
 	}
 }
