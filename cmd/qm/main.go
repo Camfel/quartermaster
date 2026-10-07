@@ -547,7 +547,9 @@ func newConfigShowCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("loading settings: %w", err)
 			}
-			data, _ := json.MarshalIndent(s, "", "  ")
+			// Never print tokens: settings.json can contain git/registry and
+			// Gotify credentials.
+			data, _ := json.MarshalIndent(s.Redacted(), "", "  ")
 			fmt.Println(string(data))
 			return nil
 		},

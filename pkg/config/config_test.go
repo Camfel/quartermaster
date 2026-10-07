@@ -538,3 +538,78 @@ func TestValidate_NetworkProfile(t *testing.T) {
 		}
 	}
 }
+
+func TestValidate_ServiceNameCharset(t *testing.T) {
+	cm := NewConfigManager()
+	newStack := func(name string) *types.Stack {
+		return &types.Stack{
+			Version:  "1",
+			Kind:     "Stack",
+			Metadata: types.Metadata{Name: "test"},
+			Spec: types.StackSpec{Services: []types.Service{
+				{Name: name, Image: "alpine"},
+			}},
+		}
+	}
+
+	for _, valid := range []string{"web", "node-exporter", "my_service", "qBittorrent"} {
+		if err := cm.validate(newStack(valid)); err != nil {
+			t.Errorf("expected %q to be a valid service name, got: %v", valid, err)
+		}
+	}
+	for _, invalid := range []string{"bad name", "<script>", "name/evil", "name.evil", "-leading", "trailing-", ""} {
+		if err := cm.validate(newStack(invalid)); err == nil {
+			t.Errorf("expected %q to be rejected as a service name", invalid)
+		}
+	}
+}
+
+func TestValidate_BindMountSourceHardening(t *testing.T) {
+	cm := NewConfigManager()
+	newStack := func(source string, mountType string) *types.Stack {
+		return &types.Stack{
+			Version:  "1",
+			Kind:     "Stack",
+			Metadata: types.Metadata{Name: "test"},
+			Spec: types.StackSpec{Services: []types.Service{
+				{
+					Name:  "svc",
+					Image: "alpine",
+					Volumes: []types.Volume{
+						{Source: source, Target: "/data", Type: mountType},
+					},
+				},
+			}},
+		}
+	}
+
+	// Dangerous host paths must be rejected even with a ".." disguise.
+	rejected := []string{
+		"/",
+		"/proc",
+		"/proc/self",
+		"/sys/class",
+		"/dev",
+		"/dev/mem",
+		"/root",
+		"/etc/quartermaster",
+		"/etc/quartermaster/secrets",
+		"/etc/shadow",
+		"/var/../etc/shadow",
+		"/run/containerd/containerd.sock",
+		"/var/run/docker.sock",
+		"relative/path",
+	}
+	for _, src := range rejected {
+		if err := cm.validate(newStack(src, "bind")); err == nil {
+			t.Errorf("expected bind source %q to be rejected", src)
+		}
+	}
+
+	// Ordinary data paths and GPU device nodes remain valid.
+	for _, src := range []string{"/srv/media", "/mnt/data/downloads", "/dev/dri", "/dev/nvidia0"} {
+		if err := cm.validate(newStack(src, "bind")); err != nil {
+			t.Errorf("expected bind source %q to be accepted, got: %v", src, err)
+		}
+	}
+}

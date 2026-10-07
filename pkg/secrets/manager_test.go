@@ -140,3 +140,44 @@ func TestTrimTrailingNewline(t *testing.T) {
 		t.Errorf("Expected no change, got '%s'", string(s2.Content))
 	}
 }
+
+func TestResolve_RejectsSymlinkEscape(t *testing.T) {
+	dir := t.TempDir()
+
+	outside := filepath.Join(t.TempDir(), "host-secret")
+	if err := os.WriteFile(outside, []byte("top-secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	link := filepath.Join(dir, "evil")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+
+	m := NewManager(dir)
+	if _, err := m.Resolve("EVIL", "evil"); err == nil {
+		t.Fatal("expected a symlink escaping the secrets dir to be rejected")
+	}
+}
+
+func TestResolve_AllowsInternalSymlink(t *testing.T) {
+	dir := t.TempDir()
+
+	target := filepath.Join(dir, "real-secret")
+	if err := os.WriteFile(target, []byte("ok"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "alias")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+
+	m := NewManager(dir)
+	secret, err := m.Resolve("ALIAS", "alias")
+	if err != nil {
+		t.Fatalf("expected an internal symlink to resolve, got: %v", err)
+	}
+	if string(secret.Content) != "ok" {
+		t.Errorf("expected content 'ok', got %q", secret.Content)
+	}
+}

@@ -46,7 +46,10 @@ func (m *Manager) Resolve(name, secretRef string) (*SecretData, error) {
 		return nil, fmt.Errorf("secret ref %q contains path traversal", secretRef)
 	}
 
-	path := filepath.Join(m.secretsDir, cleanRef)
+	path, err := resolveWithinDir(m.secretsDir, cleanRef)
+	if err != nil {
+		return nil, fmt.Errorf("secret %q: %w", name, err)
+	}
 
 	var data []byte
 
@@ -88,6 +91,34 @@ func (m *Manager) Resolve(name, secretRef string) (*SecretData, error) {
 		Content: content,
 		Path:    path,
 	}, nil
+}
+
+// resolveWithinDir joins ref onto dir and verifies the result stays inside dir
+// after symlink resolution.  This stops a symlink planted in the secrets
+// directory from causing an arbitrary host file to be read into a container.
+//
+// There is a small TOCTOU window between the check and the read; the secrets
+// directory is expected to be 0700 and owned by the daemon user, which is the
+// real control.  The containment check is defence in depth for a compromised
+// or misconfigured directory.
+func resolveWithinDir(dir, ref string) (string, error) {
+	base, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", fmt.Errorf("secrets dir %q: %w", dir, err)
+	}
+	path := filepath.Join(base, ref)
+
+	// EvalSymlinks fails when the file does not exist; leave that for the
+	// caller's read to report.  When it resolves, enforce containment.
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return path, nil
+	}
+	rel, err := filepath.Rel(base, resolved)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("secret ref %q escapes secrets dir %q", ref, dir)
+	}
+	return path, nil
 }
 
 // ResolveAll resolves a list of secret references into a map of name -> content.
