@@ -1,6 +1,7 @@
 package network
 
 import (
+	"fmt"
 	"net"
 	"testing"
 )
@@ -112,8 +113,13 @@ func TestBridgeIPAllocation(t *testing.T) {
 		t.Error("LookupIP should return nil before allocation")
 	}
 
-	// Allocate manually through the ips map.
-	bm.ips["test"] = bm.nextIPAlloc()
+	// Allocate through the real allocator.
+	bm.mu.Lock()
+	_, allocErr := bm.allocateIPLocked("test")
+	bm.mu.Unlock()
+	if allocErr != nil {
+		t.Fatalf("allocateIPLocked: %v", allocErr)
+	}
 	ip := bm.LookupIP("test")
 	if ip == nil {
 		t.Error("LookupIP should return allocated IP")
@@ -129,10 +135,52 @@ func TestBridgeIPAllocation(t *testing.T) {
 	}
 }
 
-func (b *BridgeManager) nextIPAlloc() net.IP {
-	ip := net.IP{10, 42, 0, b.nextIP}
-	b.nextIP++
-	return ip
+func TestAllocateIPReusesFreedAddress(t *testing.T) {
+	bm, err := NewBridgeManager()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bm.mu.Lock()
+	first, err := bm.allocateIPLocked("a")
+	if err != nil {
+		bm.mu.Unlock()
+		t.Fatal(err)
+	}
+	second, err := bm.allocateIPLocked("b")
+	if err != nil {
+		bm.mu.Unlock()
+		t.Fatal(err)
+	}
+	delete(bm.ips, "a")
+	third, err := bm.allocateIPLocked("c")
+	bm.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if first.String() == second.String() {
+		t.Errorf("second allocation reused the live address %s", first)
+	}
+	if third.String() != first.String() {
+		t.Errorf("expected freed address %s to be reused, got %s", first, third)
+	}
+}
+
+func TestAllocateIPExhaustion(t *testing.T) {
+	bm, err := NewBridgeManager()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+	for last := bridgeHostMin; last <= bridgeHostMax; last++ {
+		bm.ips[fmt.Sprintf("svc-%d", last)] = net.ParseIP(fmt.Sprintf("10.42.0.%d", last))
+	}
+	if _, err := bm.allocateIPLocked("overflow"); err == nil {
+		t.Error("expected allocation to fail when the pool is exhausted")
+	}
 }
 
 // TestDetachRecreateCycle verifies that the IP allocation and deallocation
@@ -149,9 +197,10 @@ func TestDetachRecreateCycle(t *testing.T) {
 	for i := 0; i < iterations; i++ {
 		// Simulate Attach: allocate IP
 		bm.mu.Lock()
-		ip := bm.nextIPAlloc()
-		bm.ips["test-service"] = ip
-		bm.nextIP++
+		if _, allocErr := bm.allocateIPLocked("test-service"); allocErr != nil {
+			bm.mu.Unlock()
+			t.Fatalf("iteration %d: allocateIPLocked: %v", i, allocErr)
+		}
 		bm.mu.Unlock()
 
 		// Verify IP was allocated
@@ -215,5 +264,33 @@ func TestShortName(t *testing.T) {
 		if got := ShortName(tt.input); got != tt.expected {
 			t.Errorf("ShortName(%q) = %q, want %q", tt.input, got, tt.expected)
 		}
+	}
+}
+
+func TestRuleDestIP(t *testing.T) {
+	cases := []struct {
+		rule string
+		want string
+		ok   bool
+	}{
+		{"-A PREROUTING -p tcp -m tcp --dport 8080 -j DNAT --to-destination 10.42.0.5:80", "10.42.0.5", true},
+		{"-A OUTPUT -p udp --dport 53 -j DNAT --to-destination 10.42.0.50:53", "10.42.0.50", true},
+		{"-A PREROUTING -p tcp --dport 80 -j ACCEPT", "", false},
+		{"-A PREROUTING -j DNAT --to-destination 10.42.0.7", "10.42.0.7", true},
+	}
+	for _, c := range cases {
+		got, ok := ruleDestIP(c.rule)
+		if ok != c.ok || got != c.want {
+			t.Errorf("ruleDestIP(%q) = (%q,%v), want (%q,%v)", c.rule, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+func TestRuleFieldExactMatch(t *testing.T) {
+	// A substring check for "80" used to match the 8080 rule; the field
+	// parser must return the whole port.
+	rule := "-A PREROUTING -p tcp -m tcp --dport 8080 -j DNAT --to-destination 10.42.0.5:80"
+	if got, ok := ruleField(rule, "--dport"); !ok || got != "8080" {
+		t.Errorf("ruleField(--dport) = (%q,%v), want (8080,true)", got, ok)
 	}
 }
