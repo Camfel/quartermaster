@@ -620,3 +620,47 @@ func TestValidate_BindMountSourceHardening(t *testing.T) {
 		}
 	}
 }
+
+func TestMergeStacks_LaterWins(t *testing.T) {
+	cm := NewConfigManager()
+	base := &types.Stack{
+		Version:  "1",
+		Kind:     "Stack",
+		Metadata: types.Metadata{Name: "base"},
+		Spec: types.StackSpec{Services: []types.Service{
+			{Name: "shared", Image: "component:v1"},
+			{Name: "base-only", Image: "base:v1"},
+		}},
+	}
+	additional := &types.Stack{
+		Version:  "1",
+		Kind:     "Stack",
+		Metadata: types.Metadata{Name: "user"},
+		Spec: types.StackSpec{Services: []types.Service{
+			{Name: "shared", Image: "user:v2"},
+			{Name: "user-only", Image: "user:v1"},
+		}},
+	}
+
+	merged := cm.MergeStacks(base, additional)
+
+	if merged.Metadata.Name != "base" {
+		t.Errorf("expected base metadata to be preserved, got %q", merged.Metadata.Name)
+	}
+	if len(merged.Spec.Services) != 3 {
+		t.Fatalf("expected 3 services, got %d", len(merged.Spec.Services))
+	}
+	byName := make(map[string]string, len(merged.Spec.Services))
+	for _, svc := range merged.Spec.Services {
+		byName[svc.Name] = svc.Image
+	}
+	if byName["shared"] != "user:v2" {
+		t.Errorf("expected the later stack to override 'shared', got %q", byName["shared"])
+	}
+	if byName["base-only"] != "base:v1" {
+		t.Errorf("base-only service should be preserved, got %q", byName["base-only"])
+	}
+	if byName["user-only"] != "user:v1" {
+		t.Errorf("user-only service should be appended, got %q", byName["user-only"])
+	}
+}
