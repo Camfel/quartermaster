@@ -440,7 +440,10 @@ func (r *RepoConfig) Validate() error {
 
 // ── Serialisation helpers ────────────────────────────────────────────────
 
-// SaveSettings writes settings to path as indented JSON with 0644 permissions.
+// SaveSettings writes settings to path as indented JSON with 0600 permissions.
+// The file may hold git registry tokens and a Gotify token, so it must not be
+// world-readable.  An existing file is re-chmodded in case it was previously
+// created with looser permissions.
 func SaveSettings(path string, s *Settings) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -451,7 +454,36 @@ func SaveSettings(path string, s *Settings) error {
 		return fmt.Errorf("failed to marshal settings: %w", err)
 	}
 	data = append(data, '\n')
-	return os.WriteFile(path, data, 0644)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0600)
+}
+
+// Redacted returns a copy of the settings with secret-bearing fields replaced
+// by a placeholder.  Use it for logging or `qm config show` so tokens are
+// never printed to a terminal, log, or support bundle.
+func (s *Settings) Redacted() *Settings {
+	if s == nil {
+		return nil
+	}
+	out := *s
+	out.ComponentToken = redactToken(out.ComponentToken)
+	out.Alerting.GotifyToken = redactToken(out.Alerting.GotifyToken)
+	out.Repos = make([]RepoConfig, len(s.Repos))
+	copy(out.Repos, s.Repos)
+	for i := range out.Repos {
+		out.Repos[i].Token = redactToken(out.Repos[i].Token)
+	}
+	return &out
+}
+
+// redactToken replaces a non-empty secret with a fixed placeholder.
+func redactToken(token string) string {
+	if token == "" {
+		return ""
+	}
+	return "***"
 }
 
 // WriteDefault writes a well-commented default settings file to path.
@@ -464,7 +496,7 @@ func WriteDefault(path string) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(defaultSettingsJSON), 0644)
+	return os.WriteFile(path, []byte(defaultSettingsJSON), 0600)
 }
 
 const defaultSettingsJSON = `{

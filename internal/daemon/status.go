@@ -225,8 +225,8 @@ func startAPI(socketPath string, status *Status, reloadCh chan struct{}, reconci
 					RestartPolicy: svc.RestartPolicy,
 					Ports:         svc.Ports,
 					Volumes:       svc.Volumes,
-					Env:           svc.Env,
-					Secrets:       svc.Secrets,
+					Env:           redactEnvVars(svc.Env),
+					Secrets:       redactSecretRefs(svc.Secrets),
 					Network:       svc.Network,
 					User:          svc.User,
 					DependsOn:     svc.DependsOn,
@@ -332,6 +332,36 @@ func recordContainers(status *Status, containers []cri.ContainerInfo, stack *typ
 		out = append(out, cs)
 	}
 	status.Containers = out
+}
+
+// redactEnvVars returns a copy of the service's env vars with literal values
+// replaced by a placeholder.  The status API is reachable by any process in
+// the quartermaster group, and env values frequently hold credentials.
+func redactEnvVars(env []types.EnvVar) []types.EnvVar {
+	if len(env) == 0 {
+		return nil
+	}
+	out := make([]types.EnvVar, len(env))
+	for i, e := range env {
+		out[i] = types.EnvVar{Name: e.Name}
+		if e.Value != "" {
+			out[i].Value = "***"
+		}
+	}
+	return out
+}
+
+// redactSecretRefs hides the on-disk secret reference while preserving the
+// container-visible mount name.
+func redactSecretRefs(refs []types.SecretRef) []types.SecretRef {
+	if len(refs) == 0 {
+		return nil
+	}
+	out := make([]types.SecretRef, len(refs))
+	for i, r := range refs {
+		out[i] = types.SecretRef{Name: r.Name, SecretRef: "***"}
+	}
+	return out
 }
 
 // formatPorts returns a human-readable list of port mappings for a service.

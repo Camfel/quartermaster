@@ -113,6 +113,71 @@ var validHealthCheckTypes = map[string]bool{
 // Matches: alpine, alpine:latest, library/alpine, docker.io/library/alpine:latest
 var imageRegex = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9._\-]*(/[a-zA-Z0-9_][a-zA-Z0-9._\-]*)*(:\w[\w.\-]*)?$`)
 
+// serviceNameRegex restricts service names to a conservative charset.  A name
+// becomes a container name, a netns/veth prefix, a log file name, and is
+// rendered in the dashboard, so spaces and punctuation are both unsafe and a
+// stored-XSS vector.
+var serviceNameRegex = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9_-]{0,61}[a-zA-Z0-9])?$`)
+
+// sensitiveHostDirs are directory trees that must never be bind-mounted into a
+// container: they grant root-equivalent control of the host or expose
+// credentials.
+var sensitiveHostDirs = []string{
+	"/proc",
+	"/sys",
+	"/boot",
+	"/root",
+	"/etc/quartermaster",
+	"/etc/ssh",
+	"/run/containerd",
+	"/var/run/containerd",
+}
+
+// sensitiveHostFiles are individual host files that must never be bind-mounted.
+// Note that /dev itself is on this list, but device nodes such as /dev/dri or
+// /dev/nvidia* are intentionally allowed for GPU workloads.
+var sensitiveHostFiles = map[string]bool{
+	"/dev":         true,
+	"/dev/mem":     true,
+	"/dev/kmem":    true,
+	"/dev/kmsg":    true,
+	"/dev/port":    true,
+	"/etc/shadow":  true,
+	"/etc/sudoers": true,
+}
+
+// containerRuntimeSockets are host sockets that let a container talk to the
+// container runtime directly, which is equivalent to host root.
+var containerRuntimeSockets = map[string]bool{
+	"/run/docker.sock":                    true,
+	"/var/run/docker.sock":                true,
+	"/run/containerd/containerd.sock":     true,
+	"/var/run/containerd/containerd.sock": true,
+	"/run/podman/podman.sock":             true,
+}
+
+// validateHostMountPath rejects bind-mount sources that would break host
+// isolation.  The path is cleaned first so "/var/../etc/shadow" cannot
+// bypass the checks.
+func validateHostMountPath(p string) error {
+	clean := filepath.Clean(p)
+	if clean == "/" {
+		return fmt.Errorf("refusing to bind-mount the host root filesystem")
+	}
+	if containerRuntimeSockets[clean] {
+		return fmt.Errorf("refusing to bind-mount container runtime socket %q", clean)
+	}
+	if sensitiveHostFiles[clean] {
+		return fmt.Errorf("refusing to bind-mount sensitive host path %q", clean)
+	}
+	for _, sensitive := range sensitiveHostDirs {
+		if clean == sensitive || strings.HasPrefix(clean, sensitive+"/") {
+			return fmt.Errorf("refusing to bind-mount sensitive host path %q", clean)
+		}
+	}
+	return nil
+}
+
 // validate performs structural and semantic validation on a Stack.
 func (cm *ConfigManager) validate(stack *types.Stack) error {
 	if stack.Version == "" {
@@ -134,13 +199,14 @@ func (cm *ConfigManager) validate(stack *types.Stack) error {
 	for i := range stack.Spec.Services {
 		svc := &stack.Spec.Services[i]
 
-		// Name is required, must be unique, and must not contain path
-		// traversal characters (used in netns paths and log directories).
+		// Name is required and must be unique. Restrict it to a conservative
+		// charset: the name becomes a container name, netns/veth prefix, log
+		// file, and is rendered in the dashboard.
 		if svc.Name == "" {
 			return fmt.Errorf("service at index %d: name is required", i)
 		}
-		if strings.ContainsAny(svc.Name, "/.\\") {
-			return fmt.Errorf("service at index %d: name %q contains invalid characters", i, svc.Name)
+		if !serviceNameRegex.MatchString(svc.Name) {
+			return fmt.Errorf("service at index %d: name %q must match %s", i, svc.Name, serviceNameRegex.String())
 		}
 		if seenNames[svc.Name] {
 			return fmt.Errorf("duplicate service name %q", svc.Name)
@@ -193,6 +259,17 @@ func (cm *ConfigManager) validate(stack *types.Stack) error {
 			}
 			if !validVolumeTypes[vol.Type] {
 				return fmt.Errorf("service %q: invalid volume type %q (must be one of: bind, volume, tmpfs)", svc.Name, vol.Type)
+			}
+			// Bind mounts are attached read-write (see pkg/cri). Require an
+			// absolute path and refuse host paths that grant the container
+			// root-equivalent control or expose credentials.
+			if vol.Type == "bind" || vol.Type == "" {
+				if !filepath.IsAbs(vol.Source) {
+					return fmt.Errorf("service %q: volume source %q must be an absolute path", svc.Name, vol.Source)
+				}
+				if err := validateHostMountPath(vol.Source); err != nil {
+					return fmt.Errorf("service %q: %w", svc.Name, err)
+				}
 			}
 		}
 
