@@ -104,6 +104,12 @@ type NetManager interface {
 	// the service uses host networking or is not known.
 	LookupIP(serviceName string) net.IP
 
+	// IPCount returns the number of bridge IPs currently allocated.
+	IPCount() int
+
+	// IPFree returns the number of bridge IPs still available.
+	IPFree() int
+
 	// Recover repopulates the IP map from persistent state after a daemon
 	// restart.  Must be called after Setup and before Attach/LookupIP.
 	Recover() error

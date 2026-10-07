@@ -45,7 +45,7 @@ type Metrics struct {
 	lkgHealthy prometheus.Gauge
 
 	// ── Per-container resource usage ────────────────────────────────
-	containerCPUSecs  *prometheus.CounterVec
+	containerCPUSecs  *prometheus.GaugeVec
 	containerMemBytes *prometheus.GaugeVec
 	containerMemLimit *prometheus.GaugeVec
 }
@@ -110,9 +110,9 @@ func New() *Metrics {
 			Help: "Whether a valid Last Known Good manifest is available (1 = healthy, 0 = degraded).",
 		}),
 
-		containerCPUSecs: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "qm_container_cpu_seconds_total",
-			Help: "Cumulative CPU time consumed by the container, in seconds.",
+		containerCPUSecs: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "qm_container_cpu_seconds",
+			Help: "Cumulative CPU time consumed by the container since it started, in seconds.",
 		}, []string{"service"}),
 
 		containerMemBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -195,10 +195,10 @@ func (m *Metrics) RecordContainerStats(service string, stats *cri.ContainerStats
 	if stats == nil {
 		return
 	}
-	// CPU is cumulative — add the delta.
-	if stats.CPUUsageSeconds > 0 {
-		m.containerCPUSecs.WithLabelValues(service).Add(stats.CPUUsageSeconds)
-	}
+	// CPUUsageSeconds is the container's cumulative total since it started,
+	// so set it as a gauge instead of adding to a counter (adding would
+	// double-count on every collection pass).
+	m.containerCPUSecs.WithLabelValues(service).Set(stats.CPUUsageSeconds)
 	m.containerMemBytes.WithLabelValues(service).Set(float64(stats.MemoryUsageBytes))
 	m.containerMemLimit.WithLabelValues(service).Set(float64(stats.MemoryLimitBytes))
 }

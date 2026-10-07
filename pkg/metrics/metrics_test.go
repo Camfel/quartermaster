@@ -201,11 +201,15 @@ func TestRecordContainerStats(t *testing.T) {
 
 	fams := gatherFams(t, m)
 
-	// CPU counter is cumulative — check per-service delta.
-	checkLabelCounter(t, fams, "qm_container_cpu_seconds_total", []string{"service"}, map[string]float64{
-		"jellyfin": 12.5,
-		"sonarr":   3.1,
-	})
+	// CPU is a gauge of the container's cumulative CPU seconds.
+	jellyCPU := findGaugeVec(t, fams, "qm_container_cpu_seconds", "service", "jellyfin")
+	if jellyCPU == nil || jellyCPU.GetValue() != 12.5 {
+		t.Errorf("jellyfin cpu: expected 12.5, got %v", gaugeVal(jellyCPU))
+	}
+	sonarrCPU := findGaugeVec(t, fams, "qm_container_cpu_seconds", "service", "sonarr")
+	if sonarrCPU == nil || sonarrCPU.GetValue() != 3.1 {
+		t.Errorf("sonarr cpu: expected 3.1, got %v", gaugeVal(sonarrCPU))
+	}
 
 	// Memory gauges.
 	jellyMem := findGaugeVec(t, fams, "qm_container_memory_bytes", "service", "jellyfin")

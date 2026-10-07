@@ -296,6 +296,7 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 	containers, listErr := d.containerClient.ListContainers(ctx)
 	if listErr == nil {
 		recordContainers(d.status, containers, stack)
+		d.updateUnhealthyMetric()
 		if d.metrics != nil {
 			running := 0
 			for _, c := range containers {
@@ -304,11 +305,53 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 				}
 			}
 			d.metrics.SetContainers(len(stack.Spec.Services), running)
+			d.recordContainerStats(ctx, containers, stack)
+			if d.netMgr != nil {
+				d.metrics.SetBridgeIPs(d.netMgr.IPCount(), d.netMgr.IPFree())
+			}
 		}
 	}
 
 	log.Println("Reconciliation complete.")
 	return nil
+}
+
+// recordContainerStats publishes per-container CPU/memory metrics.  Services
+// that are no longer running have their series removed so stale samples do not
+// persist.
+func (d *Daemon) recordContainerStats(ctx context.Context, containers []cri.ContainerInfo, stack *types.Stack) {
+	infoByName := make(map[string]cri.ContainerInfo, len(containers))
+	for _, c := range containers {
+		infoByName[c.Name] = c
+	}
+	for _, svc := range stack.Spec.Services {
+		c, ok := infoByName[svc.Name]
+		if !ok || !c.Running {
+			d.metrics.ResetContainerStats(svc.Name)
+			continue
+		}
+		stats, err := d.containerClient.ContainerStats(ctx, c.ID)
+		if err != nil {
+			log.Printf("Warning: container stats for %s: %v", svc.Name, err)
+			continue
+		}
+		d.metrics.RecordContainerStats(svc.Name, stats)
+	}
+}
+
+// updateUnhealthyMetric refreshes the unhealthy-container gauge from the
+// latest health snapshots.
+func (d *Daemon) updateUnhealthyMetric() {
+	if d.metrics == nil {
+		return
+	}
+	unhealthy := 0
+	for _, c := range d.status.snapshot().Containers {
+		if c.Healthy != nil && !*c.Healthy {
+			unhealthy++
+		}
+	}
+	d.metrics.SetUnhealthy(unhealthy)
 }
 
 // rollbackToLKG re-applies the Last Known Good manifest.  It runs on its own
@@ -364,6 +407,7 @@ func (d *Daemon) runHealthChecks(ctx context.Context) {
 	for _, c := range containers {
 		idByName[c.Name] = c.ID
 	}
+	defer d.updateUnhealthyMetric()
 
 	// Prune counters for services no longer present in the merged stack so a
 	// removed/re-added service cannot inherit an old failure streak.
