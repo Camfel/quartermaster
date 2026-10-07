@@ -45,7 +45,8 @@ type ContainerClient interface {
 	// StopContainer stops the running task.
 	StopContainer(ctx context.Context, containerID string) error
 
-	// DeleteContainer removes the container and its resources.
+	// DeleteContainer removes the container and its resources.  It is
+	// idempotent: deleting an already-removed container is not an error.
 	DeleteContainer(ctx context.Context, containerID string) error
 
 	// ListContainers returns a list of currently running containers.

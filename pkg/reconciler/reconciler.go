@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"time"
 
 	"quartermaster/pkg/config"
 	"quartermaster/pkg/cri"
@@ -233,10 +234,14 @@ func (r *Reconciler) runCreateFlow(ctx context.Context, svc types.Service, runni
 	// 3. Start Container
 	if err := r.containerClient.StartContainer(ctx, containerID); err != nil {
 		// Roll back the created container and its network resources so a
-		// failed start does not leave orphans behind.
-		if delErr := r.runDeleteFlow(ctx, containerID, svc.Name); delErr != nil {
+		// failed start does not leave orphans behind.  Use a fresh, detached
+		// context so cleanup still runs if the reconcile deadline is already
+		// exhausted.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		if delErr := r.runDeleteFlow(cleanupCtx, containerID, svc.Name); delErr != nil {
 			log.Printf("Warning: cleanup after failed start of %s: %v", svc.Name, delErr)
 		}
+		cancel()
 		return "", fmt.Errorf("start failed: %w", err)
 	}
 

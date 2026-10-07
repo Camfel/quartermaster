@@ -146,10 +146,14 @@ func (c *ContainerdClient) takeMountCleanup(containerID string) (func(), bool) {
 	return fn, ok
 }
 
-// setLogFile records the open persistent log file for a container.
+// setLogFile records the open persistent log file for a container, closing
+// any previous handle for the same ID so ownership stays unambiguous.
 func (c *ContainerdClient) setLogFile(containerID string, f *os.File) {
 	c.logMu.Lock()
 	defer c.logMu.Unlock()
+	if prev, ok := c.logFiles[containerID]; ok {
+		prev.Close()
+	}
 	c.logFiles[containerID] = f
 }
 
@@ -506,6 +510,8 @@ func (c *ContainerdClient) StartContainer(ctx context.Context, containerID strin
 			if lfErr != nil {
 				log.Printf("Warning: cannot open log file %s: %v", logPath, lfErr)
 			} else {
+				// Tighten files created by older versions with 0644.
+				_ = lf.Chmod(0600)
 				logFile = lf
 				logWriter = io.MultiWriter(rb, lf)
 			}
@@ -763,7 +769,10 @@ func (c *ContainerdClient) StopContainer(ctx context.Context, containerID string
 // DeleteContainer removes the container and its resources.
 func (c *ContainerdClient) DeleteContainer(ctx context.Context, containerID string) error {
 	c.logs.remove(containerID)
-	c.closeLogFile(containerID)
+	// Close the persistent log handle only after the task has been stopped
+	// (below).  Closing it while the container still runs makes the cio writer
+	// drop the file and close the container's stdout read end mid-shutdown.
+	defer c.closeLogFile(containerID)
 
 	// Clean up any secret/ConfigMap tmp directories.
 	if cleanup, ok := c.takeMountCleanup(containerID); ok {

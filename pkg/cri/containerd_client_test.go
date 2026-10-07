@@ -1,8 +1,10 @@
 package cri
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -25,6 +27,39 @@ func TestCloseLogFile(t *testing.T) {
 
 	// Closing an unknown container must be a no-op, not a panic.
 	c.closeLogFile("missing")
+}
+
+// TestLifecycleHelpersConcurrent exercises the mount/log maps from many
+// goroutines; meaningful under `go test -race`.
+func TestLifecycleHelpersConcurrent(t *testing.T) {
+	c := &ContainerdClient{
+		mountCleanups: make(map[string]func()),
+		logFiles:      make(map[string]*os.File),
+	}
+	dir := t.TempDir()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		id := fmt.Sprintf("ctr-%d", i)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			c.setMountCleanup(id, func() {})
+			if fn, ok := c.takeMountCleanup(id); ok {
+				fn()
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			f, err := os.OpenFile(filepath.Join(dir, id+".log"), os.O_CREATE|os.O_WRONLY, 0600)
+			if err != nil {
+				return
+			}
+			c.setLogFile(id, f)
+			c.closeLogFile(id)
+		}()
+	}
+	wg.Wait()
 }
 
 func TestTakeMountCleanup(t *testing.T) {
