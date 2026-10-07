@@ -8,7 +8,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"sort"
 	"time"
 
 	"quartermaster/pkg/config"
@@ -520,31 +519,41 @@ func (d *Daemon) runHealthChecks(ctx context.Context) {
 // from components and repos (via StackFiles).  The merged result includes
 // services from every enabled component and user repo.
 func (d *Daemon) loadMergedStack() (*types.Stack, error) {
-	stack, err := d.configManager.LoadStack(d.stackFile)
+	primary, err := d.configManager.LoadStack(d.stackFile)
 	if err != nil {
 		return nil, err
 	}
 
 	settings, sErr := config.LoadSettings(d.settingsPath)
 	if sErr != nil {
-		return stack, nil // settings not available — use primary stack only
+		return primary, nil // settings not available — use primary stack only
 	}
 
+	// StackFiles() returns component stacks first and user repos last, so a
+	// later merge overrides an earlier one.  Do NOT sort the whole list: that
+	// grouping is the precedence order.  Merge the primary (main user) stack
+	// last so customisations in it always win over component/repo defaults.
 	files := settings.StackFiles()
-	sort.Strings(files) // deterministic order regardless of map iteration
-
+	var merged *types.Stack
 	for _, f := range files {
 		if f == d.stackFile {
-			continue // already loaded as primary
+			continue // applied last as the primary stack
 		}
 		additional, aErr := d.configManager.LoadStack(f)
 		if aErr != nil {
 			log.Printf("Warning: skipping stack %s: %v", f, aErr)
 			continue
 		}
-		stack = d.configManager.MergeStacks(stack, additional)
+		if merged == nil {
+			merged = additional
+		} else {
+			merged = d.configManager.MergeStacks(merged, additional)
+		}
 	}
-	return stack, nil
+	if merged == nil {
+		return primary, nil
+	}
+	return d.configManager.MergeStacks(merged, primary), nil
 }
 
 // reload re-reads the settings file and updates the daemon's stack file path.
@@ -554,10 +563,9 @@ func (d *Daemon) reload(ctx context.Context) error {
 		return fmt.Errorf("failed to reload settings: %w", err)
 	}
 
-	files := settings.StackFiles()
-	if len(files) > 0 {
-		d.stackFile = files[0]
-	}
+	// Do not change d.stackFile here: it is the primary user stack (from
+	// --stack/QM_STACK_FILE), not the first entry of StackFiles(), which may be
+	// a component stack.
 	d.reconciler.SetIngressConfig(settings.Ingress.Domain, settings.Ingress.TLS, settings.Ingress.ExcludeServices)
 	log.Printf("Reloaded settings: stack = %s, ingress = %s/%s", d.stackFile, settings.Ingress.Domain, settings.Ingress.TLS)
 	return nil
