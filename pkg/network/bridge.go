@@ -30,6 +30,11 @@ const bridgeSubnet = "10.42.0.0/24"
 const bridgeGW = "10.42.0.1"
 const vpnRouteTable = 100
 
+// bridgeHostMin/Max bound the usable host addresses in the /24: .0 is the
+// network, .1 the gateway, and .255 the broadcast address.
+const bridgeHostMin = 2
+const bridgeHostMax = 254
+
 // ipsFile persists the service→IP mapping across daemon restarts.
 const ipsFile = "/var/lib/quartermaster/bridge-ips.json" // routing table ID for VPN egress
 
@@ -37,7 +42,6 @@ const ipsFile = "/var/lib/quartermaster/bridge-ips.json" // routing table ID for
 type BridgeManager struct {
 	mu     sync.Mutex
 	setup  bool
-	nextIP byte
 	ipt4   *iptables.IPTables
 	brLink netlink.Link
 	dns    *DNSForwarder
@@ -53,9 +57,8 @@ func NewBridgeManager() (*BridgeManager, error) {
 		return nil, fmt.Errorf("iptables: %w", err)
 	}
 	return &BridgeManager{
-		nextIP: 2,
-		ipt4:   ipt,
-		ips:    make(map[string]net.IP),
+		ipt4: ipt,
+		ips:  make(map[string]net.IP),
 	}, nil
 }
 
@@ -170,11 +173,14 @@ func (b *BridgeManager) Attach(serviceName string, profile string, vpnGateway st
 
 	// ── Allocate IP ───────────────────────────────────────────────
 	b.mu.Lock()
-	ip := net.ParseIP(fmt.Sprintf("10.42.0.%d", b.nextIP))
-	b.nextIP++
-	b.ips[serviceName] = ip
-	b.saveIPs()
+	ip, err := b.allocateIPLocked(serviceName)
+	if err == nil {
+		b.saveIPs()
+	}
 	b.mu.Unlock()
+	if err != nil {
+		return NetInfo{}, fmt.Errorf("allocate bridge IP for %s: %w", serviceName, err)
+	}
 
 	ipStr := ip.String()
 	short := ShortName(serviceName)
@@ -188,28 +194,39 @@ func (b *BridgeManager) Attach(serviceName string, profile string, vpnGateway st
 	syscall.Unmount(nsPath, syscall.MNT_DETACH)
 	os.Remove(nsPath)
 
-	// Save the host network namespace.
-	origNs, _ := netns.Get()
-	defer origNs.Close()
+	// netns.NewNamed switches the calling OS thread into the new namespace,
+	// so pin the goroutine to a single thread and restore the host namespace
+	// before releasing it.  Without LockOSThread the scheduler can migrate
+	// the goroutine and leak namespace state (AGENTS.md rule #1).
+	runtime.LockOSThread()
+	origNs, err := netns.Get()
+	if err != nil {
+		runtime.UnlockOSThread()
+		b.releaseIP(serviceName)
+		return NetInfo{}, fmt.Errorf("read host netns: %w", err)
+	}
 
 	// ── 1. Create a new network namespace ─────────────────────────
 	nsFd, err := netns.NewNamed(nsName)
 	if err != nil {
-		b.mu.Lock()
-		delete(b.ips, serviceName)
-		b.mu.Unlock()
+		netns.Set(origNs)
+		origNs.Close()
+		runtime.UnlockOSThread()
+		b.releaseIP(serviceName)
 		return NetInfo{}, fmt.Errorf("create netns %s: %w", nsName, err)
 	}
 	nsFd.Close()
 
-	// Restore host namespace.
+	// Restore the host namespace and release the pinned thread.
 	if err := netns.Set(origNs); err != nil {
+		origNs.Close()
+		runtime.UnlockOSThread()
 		b.cleanupNamespace(nsName, hostVeth)
-		b.mu.Lock()
-		delete(b.ips, serviceName)
-		b.mu.Unlock()
+		b.releaseIP(serviceName)
 		return NetInfo{}, fmt.Errorf("restore host netns: %w", err)
 	}
+	origNs.Close()
+	runtime.UnlockOSThread()
 
 	// ── 2. Clean up stale veth pair from previous run ─────────────
 	if hostLink, _ := netlink.LinkByName(hostVeth); hostLink != nil {
@@ -218,9 +235,7 @@ func (b *BridgeManager) Attach(serviceName string, profile string, vpnGateway st
 
 	// ── 3. Create veth pair ───────────────────────────────────────
 	if b.brLink == nil {
-		b.mu.Lock()
-		delete(b.ips, serviceName)
-		b.mu.Unlock()
+		b.releaseIP(serviceName)
 		return NetInfo{}, fmt.Errorf("bridge %s not initialised", bridgeName)
 	}
 	veth := &netlink.Veth{
@@ -229,9 +244,7 @@ func (b *BridgeManager) Attach(serviceName string, profile string, vpnGateway st
 	}
 	if err := netlink.LinkAdd(veth); err != nil {
 		b.cleanupNamespace(nsName, hostVeth)
-		b.mu.Lock()
-		delete(b.ips, serviceName)
-		b.mu.Unlock()
+		b.releaseIP(serviceName)
 		return NetInfo{}, fmt.Errorf("create veth pair %s/%s: %w", hostVeth, ctrVeth, err)
 	}
 
@@ -239,23 +252,17 @@ func (b *BridgeManager) Attach(serviceName string, profile string, vpnGateway st
 	hostLink, err := netlink.LinkByName(hostVeth)
 	if err != nil {
 		b.cleanupNamespace(nsName, hostVeth)
-		b.mu.Lock()
-		delete(b.ips, serviceName)
-		b.mu.Unlock()
+		b.releaseIP(serviceName)
 		return NetInfo{}, fmt.Errorf("find %s: %w", hostVeth, err)
 	}
 	if err := netlink.LinkSetMaster(hostLink, b.brLink); err != nil {
 		b.cleanupNamespace(nsName, hostVeth)
-		b.mu.Lock()
-		delete(b.ips, serviceName)
-		b.mu.Unlock()
+		b.releaseIP(serviceName)
 		return NetInfo{}, fmt.Errorf("attach %s to bridge: %w", hostVeth, err)
 	}
 	if err := netlink.LinkSetUp(hostLink); err != nil {
 		b.cleanupNamespace(nsName, hostVeth)
-		b.mu.Lock()
-		delete(b.ips, serviceName)
-		b.mu.Unlock()
+		b.releaseIP(serviceName)
 		return NetInfo{}, fmt.Errorf("bring %s up: %w", hostVeth, err)
 	}
 
@@ -263,25 +270,19 @@ func (b *BridgeManager) Attach(serviceName string, profile string, vpnGateway st
 	ctrLink, err := netlink.LinkByName(ctrVeth)
 	if err != nil {
 		b.cleanupNamespace(nsName, hostVeth)
-		b.mu.Lock()
-		delete(b.ips, serviceName)
-		b.mu.Unlock()
+		b.releaseIP(serviceName)
 		return NetInfo{}, fmt.Errorf("find %s: %w", ctrVeth, err)
 	}
 	targetNs, err := netns.GetFromName(nsName)
 	if err != nil {
 		b.cleanupNamespace(nsName, hostVeth)
-		b.mu.Lock()
-		delete(b.ips, serviceName)
-		b.mu.Unlock()
+		b.releaseIP(serviceName)
 		return NetInfo{}, fmt.Errorf("open netns %s: %w", nsName, err)
 	}
 	if err := netlink.LinkSetNsFd(ctrLink, int(targetNs)); err != nil {
 		targetNs.Close()
 		b.cleanupNamespace(nsName, hostVeth)
-		b.mu.Lock()
-		delete(b.ips, serviceName)
-		b.mu.Unlock()
+		b.releaseIP(serviceName)
 		return NetInfo{}, fmt.Errorf("move %s to netns %s: %w", ctrVeth, nsName, err)
 	}
 	targetNs.Close()
@@ -289,26 +290,62 @@ func (b *BridgeManager) Attach(serviceName string, profile string, vpnGateway st
 	// ── 6. Configure namespace: IP, routes, loopback ──────────────
 	if err := b.configureNamespace(nsName, ctrVeth, ipStr); err != nil {
 		b.cleanupNamespace(nsName, hostVeth)
-		b.mu.Lock()
-		delete(b.ips, serviceName)
-		b.mu.Unlock()
+		b.releaseIP(serviceName)
 		return NetInfo{}, fmt.Errorf("configure netns %s: %w", nsName, err)
 	}
 
-	// ── 7. VPN policy routing ─────────────────────────────────────
+	// ── 7. VPN policy routing (fail closed) ───────────────────────
+	// A VPN-routed container must not start with unprotected egress, so if
+	// the policy route cannot be installed, tear the namespace down and
+	// surface the error instead of silently logging a warning.
 	if p == ProfileVPN && vpnGateway != "" {
 		gwIP := b.LookupIP(vpnGateway)
-		if gwIP != nil {
-			if err := b.setupVPNRouting(nsName, ipStr, gwIP.String(), ctrVeth); err != nil {
-				log.Printf("Warning: VPN policy routing for %s failed: %v", serviceName, err)
-			}
-		} else {
-			log.Printf("Warning: VPN gateway %s has no bridge IP — routing not configured", vpnGateway)
+		if gwIP == nil {
+			b.cleanupNamespace(nsName, hostVeth)
+			b.releaseIP(serviceName)
+			return NetInfo{}, fmt.Errorf("VPN gateway %q has no bridge IP; refusing unprotected egress for %s", vpnGateway, serviceName)
+		}
+		if err := b.setupVPNRouting(nsName, ipStr, gwIP.String(), ctrVeth); err != nil {
+			b.cleanupNamespace(nsName, hostVeth)
+			b.releaseIP(serviceName)
+			return NetInfo{}, fmt.Errorf("VPN policy routing for %s: %w", serviceName, err)
 		}
 	}
 
 	log.Printf("Attached netns %s for %s (IP: %s, path: %s)", nsName, serviceName, ipStr, nsPath)
 	return NetInfo{NSPath: nsPath, IP: ip}, nil
+}
+
+// releaseIP removes a service's bridge IP from the map and persists the change.
+func (b *BridgeManager) releaseIP(serviceName string) {
+	b.mu.Lock()
+	delete(b.ips, serviceName)
+	b.saveIPs()
+	b.mu.Unlock()
+}
+
+// allocateIPLocked assigns the lowest free bridge IP to serviceName.  It scans
+// the allocation map instead of using a monotonic counter, so it can never
+// wrap onto the gateway/network/broadcast address or reuse a live one, and it
+// reports exhaustion rather than silently overwriting an address.
+//
+// The caller must hold b.mu; persistence is the caller's responsibility.
+func (b *BridgeManager) allocateIPLocked(serviceName string) (net.IP, error) {
+	used := make(map[byte]bool, len(b.ips))
+	for _, ip := range b.ips {
+		if ip4 := ip.To4(); ip4 != nil {
+			used[ip4[3]] = true
+		}
+	}
+	for last := bridgeHostMin; last <= bridgeHostMax; last++ {
+		if used[byte(last)] {
+			continue
+		}
+		ip := net.ParseIP(fmt.Sprintf("10.42.0.%d", last))
+		b.ips[serviceName] = ip
+		return ip, nil
+	}
+	return nil, fmt.Errorf("bridge subnet %s is exhausted (%d hosts in use)", bridgeSubnet, bridgeHostMax-bridgeHostMin+1)
 }
 
 // Detach implements NetManager.  Removes the namespace, veth pair, DNAT
@@ -417,19 +454,14 @@ func (b *BridgeManager) Recover() error {
 		if err := json.Unmarshal(data, &saved); err != nil {
 			return fmt.Errorf("parse %s: %w", ipsFile, err)
 		}
-		maxByte := byte(2)
 		for name, ipStr := range saved {
 			ip := net.ParseIP(ipStr)
 			if ip == nil {
 				continue
 			}
 			b.ips[name] = ip
-			if ip4 := ip.To4(); ip4 != nil && ip4[3] > maxByte {
-				maxByte = ip4[3]
-			}
 		}
-		b.nextIP = maxByte + 1
-		log.Printf("Recovered %d bridge IP(s) from %s (next IP: .%d)", len(b.ips), ipsFile, b.nextIP)
+		log.Printf("Recovered %d bridge IP(s) from %s", len(b.ips), ipsFile)
 
 		// Re-apply fwmark VPN routing for existing containers after restart.
 		if _, ok := b.ips["gluetun"]; ok {
@@ -598,7 +630,6 @@ func (b *BridgeManager) scanNetns() error {
 		return nil // no netns directory, nothing to recover
 	}
 
-	maxByte := byte(2)
 	for _, entry := range entries {
 		name := entry.Name()
 		if !strings.HasPrefix(name, "qm-") {
@@ -626,15 +657,11 @@ func (b *BridgeManager) scanNetns() error {
 
 		ip := addrs[0].IP
 		b.ips[short] = ip
-		if ip4 := ip.To4(); ip4 != nil && ip4[3] > maxByte {
-			maxByte = ip4[3]
-		}
 		log.Printf("Recovered bridge IP: %s → %s", short, ip)
 	}
 
-	b.nextIP = maxByte + 1
 	b.saveIPs() // persist for next restart
-	log.Printf("Scanned netns: recovered %d bridge IP(s) (next IP: .%d)", len(b.ips), b.nextIP)
+	log.Printf("Scanned netns: recovered %d bridge IP(s)", len(b.ips))
 	return nil
 }
 
@@ -771,14 +798,17 @@ func (b *BridgeManager) ExposePorts(containerName string, containerIP net.IP, po
 		for _, chain := range []string{"PREROUTING", "OUTPUT"} {
 			rules, _ := b.ipt4.List("nat", chain)
 			for _, rule := range rules {
-				if strings.Contains(rule, fmt.Sprintf("dpt:%s", dport)) &&
-					strings.Contains(rule, "--to-destination") &&
-					!strings.Contains(rule, ipStr) {
-					args := ruleToDeleteArgs(rule, ipStr)
-					if args != nil {
-						b.ipt4.Delete("nat", chain, args...)
-						log.Printf("Cleaned stale DNAT %s rule for port %s (was pointing to old IP)", chain, dport)
-					}
+				rdport, ok := ruleField(rule, "--dport")
+				if !ok || rdport != dport {
+					continue
+				}
+				destIP, ok := ruleDestIP(rule)
+				if !ok || destIP == ipStr {
+					continue
+				}
+				if args := ruleToDeleteArgs(rule, ipStr); args != nil {
+					b.ipt4.Delete("nat", chain, args...)
+					log.Printf("Cleaned stale DNAT %s rule for port %s (was pointing to %s)", chain, dport, destIP)
 				}
 			}
 		}
@@ -822,18 +852,47 @@ func (b *BridgeManager) removePorts(containerName string, ip net.IP) {
 			continue
 		}
 		for _, rule := range rules {
-			if strings.Contains(rule, "--to-destination") && strings.Contains(rule, ipStr) {
-				args := ruleToDeleteArgs(rule, ipStr)
-				if args != nil {
-					if err := b.ipt4.Delete("nat", chain, args...); err != nil {
-						log.Printf("Warning: failed to delete DNAT %s rule for %s: %v", chain, containerName, err)
-					} else {
-						log.Printf("Removed DNAT %s rule for %s (%s)", chain, containerName, ipStr)
-					}
+			destIP, ok := ruleDestIP(rule)
+			if !ok || destIP != ipStr {
+				continue
+			}
+			args := ruleToDeleteArgs(rule, ipStr)
+			if args != nil {
+				if err := b.ipt4.Delete("nat", chain, args...); err != nil {
+					log.Printf("Warning: failed to delete DNAT %s rule for %s: %v", chain, containerName, err)
+				} else {
+					log.Printf("Removed DNAT %s rule for %s (%s)", chain, containerName, ipStr)
 				}
 			}
 		}
 	}
+}
+
+// ruleField returns the value following a flag in an iptables -S rule line
+// (e.g. ruleField(rule, "--dport") returns "8080", true).
+func ruleField(rule, flag string) (string, bool) {
+	fields := strings.Fields(rule)
+	for i, f := range fields {
+		if f == flag && i+1 < len(fields) {
+			return fields[i+1], true
+		}
+	}
+	return "", false
+}
+
+// ruleDestIP extracts the IP from a DNAT rule's --to-destination value
+// ("10.42.0.5", "10.42.0.5:80" or "10.42.0.5:80-90").  Matching on the exact
+// IP avoids treating 10.42.0.5 as a prefix of 10.42.0.50.
+func ruleDestIP(rule string) (string, bool) {
+	dest, ok := ruleField(rule, "--to-destination")
+	if !ok {
+		return "", false
+	}
+	host := dest
+	if i := strings.LastIndex(host, ":"); i > 0 {
+		host = host[:i]
+	}
+	return strings.Trim(host, "[]"), true
 }
 
 // ruleToDeleteArgs converts an iptables rule line to deletion args.
@@ -1008,10 +1067,12 @@ func getHandle(nsName string) (*netlink.Handle, error) {
 	if err != nil {
 		return nil, err
 	}
-	// NewHandleAt takes ownership of the fd; don't close nsHandle.
+	// NewHandleAt binds its netlink sockets to the namespace but does not
+	// take ownership of the NsHandle fd, so close it on the way out.
+	defer nsHandle.Close()
+
 	handle, err := netlink.NewHandleAt(nsHandle)
 	if err != nil {
-		nsHandle.Close()
 		return nil, err
 	}
 	return handle, nil
