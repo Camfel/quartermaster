@@ -106,7 +106,9 @@ var validVolumeTypes = map[string]bool{
 var validHealthCheckTypes = map[string]bool{
 	"http": true,
 	"tcp":  true,
-	"exec": true,
+	// "exec" is intentionally unsupported: pkg/health does not implement exec
+	// probes, so accepting it made every probe report the service unhealthy
+	// and drove repeated restarts (and now LKG rollbacks).
 }
 
 // imageRegex validates common container image reference formats.

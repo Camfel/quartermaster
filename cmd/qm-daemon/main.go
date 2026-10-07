@@ -170,6 +170,7 @@ func main() {
 		settings.LKGPath,
 		syncInterval,
 		settings.MaxHealthFailures,
+		settings.HealthCheckDuration(),
 		watchers,
 		m,
 		metricsAddr,
