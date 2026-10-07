@@ -167,7 +167,7 @@ func (r *Reconciler) ReconcileStack(ctx context.Context, stack *types.Stack) err
 
 			if needsUpdate {
 				log.Printf("Service %s config changed (hash: %s -> %s). Updating...",
-					svc.Name, actual.ConfigHash[:12], svc.ConfigHash[:12])
+					svc.Name, shortHash(actual.ConfigHash), shortHash(svc.ConfigHash))
 				if err := r.runUpdateFlow(ctx, actual.ID, svc); err != nil {
 					log.Printf("Error updating service %s: %v", svc.Name, err)
 				}
@@ -269,6 +269,16 @@ func (r *Reconciler) runUpdateFlow(ctx context.Context, oldContainerID string, s
 
 	_, err := r.runCreateFlow(ctx, svc, nil, nil)
 	return err
+}
+
+// shortHash truncates a config hash for logging.  It tolerates short or empty
+// hashes (e.g. containers created before the config-hash label existed or by
+// another tool) instead of panicking on a slice out of range.
+func shortHash(h string) string {
+	if len(h) > 12 {
+		return h[:12]
+	}
+	return h
 }
 
 // serviceConfigHash computes a SHA256 hash of the service's mutable configuration fields.

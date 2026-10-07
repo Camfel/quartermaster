@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"quartermaster/pkg/cri"
@@ -18,7 +19,13 @@ import (
 // ── Status types ─────────────────────────────────────────────────────────
 
 // Status holds the daemon's observable state.
+//
+// The daemon writes status from the reconcile, health-check, and schedule
+// goroutines while the status API reads it concurrently, so every access must
+// go through the methods below (or hold mu).
 type Status struct {
+	mu sync.RWMutex
+
 	Version string `json:"version"`
 
 	StartedAt time.Time `json:"started_at"`
@@ -86,8 +93,9 @@ func startAPI(socketPath string, status *Status, reloadCh chan struct{}, reconci
 			return
 		}
 
-		// Compute uptime on read.
-		s := *status
+		// Compute uptime on read.  snapshot() copies the fields under the
+		// status lock so encoding cannot race a concurrent reconcile write.
+		s := status.snapshot()
 		s.Uptime = time.Since(s.StartedAt).Truncate(time.Second).String()
 		if s.Containers == nil {
 			s.Containers = []ContainerStatus{}
@@ -240,7 +248,7 @@ func startAPI(socketPath string, status *Status, reloadCh chan struct{}, reconci
 					resp.Resources = svc.Resources
 				}
 				// Merge runtime status from container snapshot.
-				for _, c := range status.Containers {
+				for _, c := range status.snapshot().Containers {
 					if c.Name == name {
 						resp.Running = c.Running
 						resp.PID = c.PID
@@ -255,7 +263,7 @@ func startAPI(socketPath string, status *Status, reloadCh chan struct{}, reconci
 		}
 
 		// ── Fallback: return container snapshot if no spec lookup ──
-		for _, c := range status.Containers {
+		for _, c := range status.snapshot().Containers {
 			if c.Name == name {
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(c)
@@ -285,9 +293,63 @@ func startAPI(socketPath string, status *Status, reloadCh chan struct{}, reconci
 
 // ── State helpers ────────────────────────────────────────────────────────
 
+// snapshot returns a consistent copy of the observable status for encoding.
+func (s *Status) snapshot() *Status {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return &Status{
+		Version:            s.Version,
+		StartedAt:          s.StartedAt,
+		LastReconcile:      s.LastReconcile,
+		LastReconcileError: s.LastReconcileError,
+		ReconcileCount:     s.ReconcileCount,
+		Containers:         append([]ContainerStatus(nil), s.Containers...),
+		LKGHealthy:         s.LKGHealthy,
+		LKGError:           s.LKGError,
+	}
+}
+
+// setLKG records the health of the Last Known Good manifest.
+func (s *Status) setLKG(healthy bool, errMsg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.LKGHealthy = healthy
+	s.LKGError = errMsg
+}
+
+// lkgHealthy reports whether the Last Known Good manifest is healthy.
+func (s *Status) lkgHealthy() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.LKGHealthy
+}
+
+// stack returns the most recent merged stack.  The stack is replaced, never
+// mutated in place, so the returned pointer is safe to read without the lock.
+func (s *Status) stack() *types.Stack {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.currentStack
+}
+
+// setContainerHealth records a health probe result for a service.
+func (s *Status) setContainerHealth(name string, healthy bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.Containers {
+		if s.Containers[i].Name == name {
+			h := healthy
+			s.Containers[i].Healthy = &h
+			return
+		}
+	}
+}
+
 // recordReconcile updates the status after a reconciliation attempt.
 func recordReconcile(status *Status, err error) {
 	now := time.Now()
+	status.mu.Lock()
+	defer status.mu.Unlock()
 	status.LastReconcile = &now
 	status.ReconcileCount++
 	if err != nil {
@@ -301,11 +363,14 @@ func recordReconcile(status *Status, err error) {
 // Preserves existing health-check results that may have been set by
 // runHealthChecks between reconcile passes.
 func recordContainers(status *Status, containers []cri.ContainerInfo, stack *types.Stack) {
-	status.currentStack = stack
 	svcMap := make(map[string]types.Service, len(stack.Spec.Services))
 	for _, svc := range stack.Spec.Services {
 		svcMap[svc.Name] = svc
 	}
+
+	status.mu.Lock()
+	defer status.mu.Unlock()
+	status.currentStack = stack
 
 	// Snapshot current health states before rebuilding.
 	prevHealthy := make(map[string]*bool, len(status.Containers))

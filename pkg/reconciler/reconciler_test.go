@@ -171,3 +171,16 @@ func TestServiceConfigHash_DifferentFields(t *testing.T) {
 		t.Error("different name should NOT change config hash")
 	}
 }
+
+func TestShortHash(t *testing.T) {
+	if got := shortHash(""); got != "" {
+		t.Errorf("empty hash: got %q, want empty", got)
+	}
+	if got := shortHash("abc"); got != "abc" {
+		t.Errorf("short hash: got %q, want abc", got)
+	}
+	long := "0123456789abcdef0123456789abcdef"
+	if got := shortHash(long); got != long[:12] {
+		t.Errorf("long hash: got %q, want %q", got, long[:12])
+	}
+}
