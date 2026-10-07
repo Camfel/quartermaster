@@ -201,11 +201,22 @@ func TestRecordContainerStats(t *testing.T) {
 
 	fams := gatherFams(t, m)
 
-	// CPU counter is cumulative — check per-service delta.
-	checkLabelCounter(t, fams, "qm_container_cpu_seconds_total", []string{"service"}, map[string]float64{
-		"jellyfin": 12.5,
-		"sonarr":   3.1,
-	})
+	// CPU is a gauge of the container's cumulative CPU seconds.
+	jellyCPU := findGaugeVec(t, fams, "qm_container_cpu_seconds", "service", "jellyfin")
+	if jellyCPU == nil || jellyCPU.GetValue() != 12.5 {
+		t.Errorf("jellyfin cpu: expected 12.5, got %v", gaugeVal(jellyCPU))
+	}
+	sonarrCPU := findGaugeVec(t, fams, "qm_container_cpu_seconds", "service", "sonarr")
+	if sonarrCPU == nil || sonarrCPU.GetValue() != 3.1 {
+		t.Errorf("sonarr cpu: expected 3.1, got %v", gaugeVal(sonarrCPU))
+	}
+
+	// CPU must be a gauge (cumulative value), not a counter.
+	for _, f := range fams {
+		if f.GetName() == "qm_container_cpu_seconds" && f.GetType() != dto.MetricType_GAUGE {
+			t.Errorf("qm_container_cpu_seconds should be a gauge, got %v", f.GetType())
+		}
+	}
 
 	// Memory gauges.
 	jellyMem := findGaugeVec(t, fams, "qm_container_memory_bytes", "service", "jellyfin")
@@ -242,6 +253,25 @@ func TestResetContainerStats(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestResetContainerStatsNotIn(t *testing.T) {
+	m := New()
+	for _, name := range []string{"a", "b", "c"} {
+		m.RecordContainerStats(name, &cri.ContainerStats{CPUUsageSeconds: 1})
+	}
+	m.ResetContainerStatsNotIn(map[string]bool{"a": true, "c": true})
+
+	fams := gatherFams(t, m)
+	if findGaugeVec(t, fams, "qm_container_cpu_seconds", "service", "a") == nil {
+		t.Error("expected service a to be retained")
+	}
+	if findGaugeVec(t, fams, "qm_container_cpu_seconds", "service", "c") == nil {
+		t.Error("expected service c to be retained")
+	}
+	if findGaugeVec(t, fams, "qm_container_cpu_seconds", "service", "b") != nil {
+		t.Error("expected service b to be reset")
 	}
 }
 

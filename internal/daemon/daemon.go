@@ -114,6 +114,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	log.Printf("Daemon loop started. Sync interval: %v, Health interval: %v", d.syncInterval, healthInterval)
 
+	// Status starts out assuming a healthy LKG; keep the gauge in sync.
+	d.setLKGHealthyMetric(true)
+
 	// ── Start git watchers ─────────────────────────────────────────
 	for _, w := range d.watchers {
 		go func(watcher *git.Watcher) {
@@ -290,12 +293,14 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 		log.Printf("Warning: failed to save LKG: %v", err)
 	}
 	d.status.setLKG(true, "")
+	d.setLKGHealthyMetric(true)
 
 	recordReconcile(d.status, nil)
 
 	containers, listErr := d.containerClient.ListContainers(ctx)
 	if listErr == nil {
 		recordContainers(d.status, containers, stack)
+		d.updateUnhealthyMetric()
 		if d.metrics != nil {
 			running := 0
 			for _, c := range containers {
@@ -304,11 +309,71 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 				}
 			}
 			d.metrics.SetContainers(len(stack.Spec.Services), running)
+			d.recordContainerStats(ctx, containers, stack)
+			if d.netMgr != nil {
+				d.metrics.SetBridgeIPs(d.netMgr.IPCount(), d.netMgr.IPFree())
+			}
 		}
 	}
 
 	log.Println("Reconciliation complete.")
 	return nil
+}
+
+// recordContainerStats publishes per-container CPU/memory metrics.  Services
+// that are no longer running have their series removed so stale samples do not
+// persist.
+func (d *Daemon) recordContainerStats(ctx context.Context, containers []cri.ContainerInfo, stack *types.Stack) {
+	if d.metrics == nil {
+		return
+	}
+	// Bound the stats RPCs so a wedged containerd cannot stall the event loop.
+	statsCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	infoByName := make(map[string]cri.ContainerInfo, len(containers))
+	for _, c := range containers {
+		infoByName[c.Name] = c
+	}
+	keep := make(map[string]bool, len(stack.Spec.Services))
+	for _, svc := range stack.Spec.Services {
+		keep[svc.Name] = true
+		c, ok := infoByName[svc.Name]
+		if !ok || !c.Running {
+			d.metrics.ResetContainerStats(svc.Name)
+			continue
+		}
+		stats, err := d.containerClient.ContainerStats(statsCtx, c.ID)
+		if err != nil {
+			log.Printf("Warning: container stats for %s: %v", svc.Name, err)
+			continue
+		}
+		d.metrics.RecordContainerStats(svc.Name, stats)
+	}
+	// Drop series for services deleted or renamed in the manifest.
+	d.metrics.ResetContainerStatsNotIn(keep)
+}
+
+// setLKGHealthyMetric mirrors the LKG status into the metrics registry.
+func (d *Daemon) setLKGHealthyMetric(healthy bool) {
+	if d.metrics != nil {
+		d.metrics.SetLKGHealthy(healthy)
+	}
+}
+
+// updateUnhealthyMetric refreshes the unhealthy-container gauge from the
+// latest health snapshots.
+func (d *Daemon) updateUnhealthyMetric() {
+	if d.metrics == nil {
+		return
+	}
+	unhealthy := 0
+	for _, c := range d.status.snapshot().Containers {
+		if c.Healthy != nil && !*c.Healthy {
+			unhealthy++
+		}
+	}
+	d.metrics.SetUnhealthy(unhealthy)
 }
 
 // rollbackToLKG re-applies the Last Known Good manifest.  It runs on its own
@@ -332,15 +397,18 @@ func (d *Daemon) rollbackToLKG(ctx context.Context) bool {
 	if err != nil {
 		log.Printf("Cannot roll back — LKG manifest %s is invalid: %v", d.lkgPath, err)
 		d.status.setLKG(false, err.Error())
+		d.setLKGHealthyMetric(false)
 		return false
 	}
 	if err := d.reconciler.ReconcileStack(rollbackCtx, lkg); err != nil {
 		log.Printf("LKG rollback also failed: %v", err)
 		d.status.setLKG(false, err.Error())
+		d.setLKGHealthyMetric(false)
 		return false
 	}
 	log.Println("LKG rollback successful.")
 	d.status.setLKG(true, "")
+	d.setLKGHealthyMetric(true)
 	return true
 }
 
@@ -364,6 +432,7 @@ func (d *Daemon) runHealthChecks(ctx context.Context) {
 	for _, c := range containers {
 		idByName[c.Name] = c.ID
 	}
+	defer d.updateUnhealthyMetric()
 
 	// Prune counters for services no longer present in the merged stack so a
 	// removed/re-added service cannot inherit an old failure streak.

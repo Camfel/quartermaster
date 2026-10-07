@@ -12,6 +12,7 @@ package metrics
 
 import (
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -23,6 +24,11 @@ import (
 // Metrics holds all Quartermaster Prometheus metrics and a dedicated registry.
 type Metrics struct {
 	reg *prometheus.Registry
+
+	// statsServices tracks which services currently have per-container series
+	// so that series for removed or renamed services can be cleaned up.
+	statsMu       sync.Mutex
+	statsServices map[string]bool
 
 	// ── Reconciliation ──────────────────────────────────────────────
 	reconcileTotal    *prometheus.CounterVec
@@ -45,7 +51,7 @@ type Metrics struct {
 	lkgHealthy prometheus.Gauge
 
 	// ── Per-container resource usage ────────────────────────────────
-	containerCPUSecs  *prometheus.CounterVec
+	containerCPUSecs  *prometheus.GaugeVec
 	containerMemBytes *prometheus.GaugeVec
 	containerMemLimit *prometheus.GaugeVec
 }
@@ -56,7 +62,8 @@ func New() *Metrics {
 	reg := prometheus.NewRegistry()
 
 	m := &Metrics{
-		reg: reg,
+		reg:           reg,
+		statsServices: make(map[string]bool),
 
 		reconcileTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "qm_reconcile_total",
@@ -110,9 +117,9 @@ func New() *Metrics {
 			Help: "Whether a valid Last Known Good manifest is available (1 = healthy, 0 = degraded).",
 		}),
 
-		containerCPUSecs: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "qm_container_cpu_seconds_total",
-			Help: "Cumulative CPU time consumed by the container, in seconds.",
+		containerCPUSecs: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "qm_container_cpu_seconds",
+			Help: "Cumulative CPU time consumed by the container since it started, in seconds.",
 		}, []string{"service"}),
 
 		containerMemBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -195,12 +202,34 @@ func (m *Metrics) RecordContainerStats(service string, stats *cri.ContainerStats
 	if stats == nil {
 		return
 	}
-	// CPU is cumulative — add the delta.
-	if stats.CPUUsageSeconds > 0 {
-		m.containerCPUSecs.WithLabelValues(service).Add(stats.CPUUsageSeconds)
-	}
+	// CPUUsageSeconds is the container's cumulative total since it started,
+	// so set it as a gauge instead of adding to a counter (adding would
+	// double-count on every collection pass).
+	m.containerCPUSecs.WithLabelValues(service).Set(stats.CPUUsageSeconds)
 	m.containerMemBytes.WithLabelValues(service).Set(float64(stats.MemoryUsageBytes))
 	m.containerMemLimit.WithLabelValues(service).Set(float64(stats.MemoryLimitBytes))
+
+	m.statsMu.Lock()
+	m.statsServices[service] = true
+	m.statsMu.Unlock()
+}
+
+// ResetContainerStatsNotIn removes per-container series for services that are
+// not in keep.  Call after a reconcile so series for services deleted or
+// renamed in the manifest do not linger until the daemon restarts.
+func (m *Metrics) ResetContainerStatsNotIn(keep map[string]bool) {
+	m.statsMu.Lock()
+	var stale []string
+	for name := range m.statsServices {
+		if !keep[name] {
+			stale = append(stale, name)
+		}
+	}
+	m.statsMu.Unlock()
+
+	for _, name := range stale {
+		m.ResetContainerStats(name)
+	}
 }
 
 // ResetContainerStats removes all per-container metrics for a service.
@@ -210,6 +239,10 @@ func (m *Metrics) ResetContainerStats(service string) {
 	m.containerCPUSecs.DeleteLabelValues(service)
 	m.containerMemBytes.DeleteLabelValues(service)
 	m.containerMemLimit.DeleteLabelValues(service)
+
+	m.statsMu.Lock()
+	delete(m.statsServices, service)
+	m.statsMu.Unlock()
 }
 
 // ── HTTP ───────────────────────────────────────────────────────────────
