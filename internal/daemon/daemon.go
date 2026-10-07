@@ -41,6 +41,12 @@ type Daemon struct {
 	lkgPath             string
 	consecutiveFailures int
 	maxFailures         int
+	healthInterval      time.Duration
+
+	// healthFailures counts consecutive failed health probes per service,
+	// used to escalate to an LKG rollback.  Only touched from the daemon
+	// event loop.
+	healthFailures map[string]int
 
 	status *Status
 
@@ -60,6 +66,7 @@ func NewDaemon(
 	lkgPath string,
 	syncInterval time.Duration,
 	maxFailures int,
+	healthInterval time.Duration,
 	watchers []*git.Watcher,
 	m *metrics.Metrics,
 	metricsAddr string,
@@ -76,6 +83,7 @@ func NewDaemon(
 		lkgPath:         lkgPath,
 		syncInterval:    syncInterval,
 		maxFailures:     maxFailures,
+		healthInterval:  healthInterval,
 		healthChecker:   health.NewChecker(),
 		watchers:        watchers,
 		metrics:         m,
@@ -88,6 +96,7 @@ func NewDaemon(
 			StartedAt:  time.Now(),
 			LKGHealthy: true, // assume healthy until proven otherwise
 		},
+		healthFailures: make(map[string]int),
 	}
 }
 
@@ -96,10 +105,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	ticker := time.NewTicker(d.syncInterval)
 	defer ticker.Stop()
 
-	healthTicker := time.NewTicker(30 * time.Second)
+	healthInterval := d.healthInterval
+	if healthInterval <= 0 {
+		healthInterval = 30 * time.Second
+	}
+	healthTicker := time.NewTicker(healthInterval)
 	defer healthTicker.Stop()
 
-	log.Printf("Daemon loop started. Sync interval: %v, Health interval: 30s", d.syncInterval)
+	log.Printf("Daemon loop started. Sync interval: %v, Health interval: %v", d.syncInterval, healthInterval)
 
 	// ── Start git watchers ─────────────────────────────────────────
 	for _, w := range d.watchers {
@@ -259,21 +272,12 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 		d.consecutiveFailures++
 		log.Printf("Reconciliation failed (%d consecutive): %v", d.consecutiveFailures, err)
 
-		// Roll back to LKG after N consecutive failures.
+		// Roll back to LKG after N consecutive failures.  Pass the daemon
+		// context (not reconCtx) so the rollback gets a fresh timeout but
+		// still aborts on shutdown.
 		if d.maxFailures > 0 && d.consecutiveFailures >= d.maxFailures {
-			log.Printf("Rolling back to Last Known Good manifest: %s", d.lkgPath)
-			if lkg, lkgErr := d.configManager.LoadStack(d.lkgPath); lkgErr == nil {
-				if rollbackErr := d.reconciler.ReconcileStack(reconCtx, lkg); rollbackErr != nil {
-					log.Printf("LKG rollback also failed: %v", rollbackErr)
-					d.status.setLKG(false, rollbackErr.Error())
-				} else {
-					log.Println("LKG rollback successful.")
-					d.consecutiveFailures = 0
-					d.status.setLKG(true, "")
-				}
-			} else {
-				log.Printf("Cannot roll back — LKG manifest %s is invalid: %v", d.lkgPath, lkgErr)
-				d.status.setLKG(false, lkgErr.Error())
+			if d.rollbackToLKG(ctx) {
+				d.consecutiveFailures = 0
 			}
 		}
 		recordReconcile(d.status, err)
@@ -307,6 +311,39 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 	return nil
 }
 
+// rollbackToLKG re-applies the Last Known Good manifest.  It runs on its own
+// timeout, independent of the caller's deadline, because the reconcile pass
+// that triggered it may already have exhausted its context.  Shared by the
+// reconcile failure path and the health-check escalation path.
+func (d *Daemon) rollbackToLKG(ctx context.Context) bool {
+	log.Printf("Rolling back to Last Known Good manifest: %s", d.lkgPath)
+
+	timeout := 2 * d.syncInterval
+	if timeout < time.Minute {
+		timeout = time.Minute
+	}
+	// Derive from the daemon context so a shutdown still cancels the
+	// rollback, but give it a fresh deadline so it is not bounded by the
+	// reconcile pass that triggered it.
+	rollbackCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	lkg, err := d.configManager.LoadStack(d.lkgPath)
+	if err != nil {
+		log.Printf("Cannot roll back — LKG manifest %s is invalid: %v", d.lkgPath, err)
+		d.status.setLKG(false, err.Error())
+		return false
+	}
+	if err := d.reconciler.ReconcileStack(rollbackCtx, lkg); err != nil {
+		log.Printf("LKG rollback also failed: %v", err)
+		d.status.setLKG(false, err.Error())
+		return false
+	}
+	log.Println("LKG rollback successful.")
+	d.status.setLKG(true, "")
+	return true
+}
+
 // runHealthChecks probes every service with a configured health check.
 // Unhealthy containers are stopped and deleted so the reconciler redeploys
 // them on the next pass.
@@ -328,6 +365,18 @@ func (d *Daemon) runHealthChecks(ctx context.Context) {
 		idByName[c.Name] = c.ID
 	}
 
+	// Prune counters for services no longer present in the merged stack so a
+	// removed/re-added service cannot inherit an old failure streak.
+	configured := make(map[string]bool, len(stack.Spec.Services))
+	for _, svc := range stack.Spec.Services {
+		configured[svc.Name] = true
+	}
+	for name := range d.healthFailures {
+		if !configured[name] {
+			delete(d.healthFailures, name)
+		}
+	}
+
 	for _, svc := range stack.Spec.Services {
 		if svc.HealthCheck == nil {
 			continue
@@ -335,6 +384,9 @@ func (d *Daemon) runHealthChecks(ctx context.Context) {
 
 		containerID, exists := idByName[svc.Name]
 		if !exists {
+			// No running container to probe; clear any previous streak so a
+			// later incarnation does not trip the threshold immediately.
+			delete(d.healthFailures, svc.Name)
 			continue
 		}
 
@@ -360,11 +412,27 @@ func (d *Daemon) runHealthChecks(ctx context.Context) {
 		}
 
 		if result.Healthy {
+			delete(d.healthFailures, svc.Name)
 			continue
 		}
 
-		log.Printf("Health check failed for %s (%s): %v — restarting",
-			svc.Name, result.Type, result.Error)
+		d.healthFailures[svc.Name]++
+		failures := d.healthFailures[svc.Name]
+
+		// After max_health_failures consecutive failures, escalate from a
+		// restart to a Last Known Good rollback.  The rollback reconciles the
+		// LKG stack itself, so do not also queue a reconcile for the current
+		// (broken) desired state — that would immediately undo it.
+		if d.maxFailures > 0 && failures >= d.maxFailures {
+			log.Printf("Health check for %s failed %d consecutive times — rolling back to LKG", svc.Name, failures)
+			if d.rollbackToLKG(ctx) {
+				delete(d.healthFailures, svc.Name)
+			}
+			break
+		}
+
+		log.Printf("Health check failed for %s (%s) %d/%d: %v — restarting",
+			svc.Name, result.Type, failures, d.maxFailures, result.Error)
 
 		if err := d.containerClient.StopContainer(ctx, containerID); err != nil {
 			log.Printf("Warning: stop failed for %s: %v", svc.Name, err)

@@ -108,21 +108,28 @@ func TestResolvePort(t *testing.T) {
 			Port: 9090,
 		},
 	}
-	port := resolvePort(svc, svc.HealthCheck)
+	port := resolvePort(svc, svc.HealthCheck, "")
 	if port != 9090 {
 		t.Errorf("expected healthcheck port 9090, got %d", port)
 	}
 
-	// Falls back to first host port
+	// Host-networked (no bridge IP): fall back to the published host port.
 	svc.HealthCheck.Port = 0
-	port = resolvePort(svc, svc.HealthCheck)
+	port = resolvePort(svc, svc.HealthCheck, "")
 	if port != 8080 {
 		t.Errorf("expected first host port 8080, got %d", port)
 	}
 
+	// Bridge-networked: the probe targets the container namespace, so use
+	// the container port rather than the host mapping.
+	port = resolvePort(svc, svc.HealthCheck, "10.42.0.5")
+	if port != 80 {
+		t.Errorf("expected container port 80 for bridge probe, got %d", port)
+	}
+
 	// Falls back to 80
 	svc.Ports = nil
-	port = resolvePort(svc, svc.HealthCheck)
+	port = resolvePort(svc, svc.HealthCheck, "")
 	if port != 80 {
 		t.Errorf("expected default port 80, got %d", port)
 	}
