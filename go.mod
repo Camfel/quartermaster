@@ -6,6 +6,7 @@ require (
 	github.com/containerd/cgroups v1.1.0
 	github.com/containerd/containerd v1.7.36
 	github.com/containerd/containerd/api v1.8.0
+	github.com/containerd/errdefs v0.3.0
 	github.com/coreos/go-iptables v0.8.0
 	github.com/go-git/go-git/v5 v5.19.2
 	github.com/gogo/protobuf v1.3.2
@@ -33,7 +34,6 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/containerd/continuity v0.4.4 // indirect
-	github.com/containerd/errdefs v0.3.0 // indirect
 	github.com/containerd/fifo v1.1.0 // indirect
 	github.com/containerd/log v0.1.0 // indirect
 	github.com/containerd/platforms v0.2.1 // indirect
