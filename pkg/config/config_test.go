@@ -122,6 +122,8 @@ func TestValidate_InvalidImage(t *testing.T) {
 		"",                  // empty
 		"image with spaces", // spaces
 		"repo:tag:extra",    // multiple colons
+		"alpine:",           // empty tag
+		"alpine@sha256:abc", // malformed digest
 	}
 	for _, img := range cases {
 		stack := &types.Stack{
@@ -150,6 +152,11 @@ func TestValidate_ValidImages(t *testing.T) {
 		"docker.io/library/alpine:latest",
 		"nginx:1.25",
 		"ghcr.io/owner/repo:v1.2.3",
+		"localhost:5000/app:tag",
+		"registry.example.com:5000/team/app",
+		"ghcr.io/owner/repo@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"alpine@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"nginx:1.25@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 	}
 	for _, img := range cases {
 		stack := &types.Stack{

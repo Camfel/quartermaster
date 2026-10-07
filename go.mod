@@ -8,6 +8,7 @@ require (
 	github.com/containerd/containerd/api v1.8.0
 	github.com/containerd/errdefs v0.3.0
 	github.com/coreos/go-iptables v0.8.0
+	github.com/distribution/reference v0.6.0
 	github.com/go-git/go-git/v5 v5.19.2
 	github.com/gogo/protobuf v1.3.2
 	github.com/miekg/dns v1.1.72
@@ -41,7 +42,6 @@ require (
 	github.com/containerd/typeurl/v2 v2.1.1 // indirect
 	github.com/cyphar/filepath-securejoin v0.6.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/distribution/reference v0.6.0 // indirect
 	github.com/docker/go-events v0.0.0-20190806004212-e31b211e4f1c // indirect
 	github.com/emirpasic/gods v1.18.1 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
