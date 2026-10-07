@@ -71,8 +71,7 @@ func (cm *ConfigManager) SaveStack(path string, stack *types.Stack) error {
 
 // MergeStacks combines two stacks into one. Services from the second stack
 // are appended to the first.  The first stack's metadata is preserved.
-// Duplicate service names: the additional (later) stack wins, so user repos
-// override component defaults.
+// Duplicate service names: the first stack wins.
 func (cm *ConfigManager) MergeStacks(base, additional *types.Stack) *types.Stack {
 	seen := make(map[string]bool, len(base.Spec.Services))
 	for _, svc := range base.Spec.Services {

@@ -155,6 +155,8 @@ func TestValidate_ValidImages(t *testing.T) {
 		"localhost:5000/app:tag",
 		"registry.example.com:5000/team/app",
 		"ghcr.io/owner/repo@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"alpine@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"nginx:1.25@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 	}
 	for _, img := range cases {
 		stack := &types.Stack{
