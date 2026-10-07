@@ -13,6 +13,7 @@ import (
 
 	"quartermaster/pkg/types"
 
+	"github.com/distribution/reference"
 	"gopkg.in/yaml.v3"
 )
 
@@ -70,7 +71,8 @@ func (cm *ConfigManager) SaveStack(path string, stack *types.Stack) error {
 
 // MergeStacks combines two stacks into one. Services from the second stack
 // are appended to the first.  The first stack's metadata is preserved.
-// Duplicate service names: the first stack wins.
+// Duplicate service names: the additional (later) stack wins, so user repos
+// override component defaults.
 func (cm *ConfigManager) MergeStacks(base, additional *types.Stack) *types.Stack {
 	seen := make(map[string]bool, len(base.Spec.Services))
 	for _, svc := range base.Spec.Services {
@@ -110,10 +112,6 @@ var validHealthCheckTypes = map[string]bool{
 	// probes, so accepting it made every probe report the service unhealthy
 	// and drove repeated restarts (and now LKG rollbacks).
 }
-
-// imageRegex validates common container image reference formats.
-// Matches: alpine, alpine:latest, library/alpine, docker.io/library/alpine:latest
-var imageRegex = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9._\-]*(/[a-zA-Z0-9_][a-zA-Z0-9._\-]*)*(:\w[\w.\-]*)?$`)
 
 // serviceNameRegex restricts service names to a conservative charset.  A name
 // becomes a container name, a netns/veth prefix, a log file name, and is
@@ -364,15 +362,11 @@ func (cm *ConfigManager) validate(stack *types.Stack) error {
 }
 
 // validateImage checks that a container image reference is syntactically valid.
+// It uses the same parser as the container runtime, so registry hosts with a
+// port (e.g. localhost:5000/app:tag) and digest references are accepted.
 func validateImage(image string) error {
-	if !imageRegex.MatchString(image) {
-		return fmt.Errorf("does not match valid image reference format")
-	}
-	if strings.Contains(image, " ") {
-		return fmt.Errorf("image reference contains spaces")
-	}
-	if strings.Count(image, ":") > 1 {
-		return fmt.Errorf("image reference contains multiple colons")
+	if _, err := reference.ParseNormalizedNamed(image); err != nil {
+		return fmt.Errorf("invalid image reference: %w", err)
 	}
 	return nil
 }
