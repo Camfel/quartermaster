@@ -170,12 +170,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 
 	serviceLookup := func(name string) *types.Service {
-		if d.status.currentStack == nil {
+		stack := d.status.stack()
+		if stack == nil {
 			return nil
 		}
-		for i := range d.status.currentStack.Spec.Services {
-			if d.status.currentStack.Spec.Services[i].Name == name {
-				return &d.status.currentStack.Spec.Services[i]
+		for i := range stack.Spec.Services {
+			if stack.Spec.Services[i].Name == name {
+				return &stack.Spec.Services[i]
 			}
 		}
 		return nil
@@ -264,18 +265,15 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 			if lkg, lkgErr := d.configManager.LoadStack(d.lkgPath); lkgErr == nil {
 				if rollbackErr := d.reconciler.ReconcileStack(reconCtx, lkg); rollbackErr != nil {
 					log.Printf("LKG rollback also failed: %v", rollbackErr)
-					d.status.LKGHealthy = false
-					d.status.LKGError = rollbackErr.Error()
+					d.status.setLKG(false, rollbackErr.Error())
 				} else {
 					log.Println("LKG rollback successful.")
 					d.consecutiveFailures = 0
-					d.status.LKGHealthy = true
-					d.status.LKGError = ""
+					d.status.setLKG(true, "")
 				}
 			} else {
 				log.Printf("Cannot roll back — LKG manifest %s is invalid: %v", d.lkgPath, lkgErr)
-				d.status.LKGHealthy = false
-				d.status.LKGError = lkgErr.Error()
+				d.status.setLKG(false, lkgErr.Error())
 			}
 		}
 		recordReconcile(d.status, err)
@@ -287,8 +285,7 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 	if err := d.configManager.SaveStack(d.lkgPath, stack); err != nil {
 		log.Printf("Warning: failed to save LKG: %v", err)
 	}
-	d.status.LKGHealthy = true
-	d.status.LKGError = ""
+	d.status.setLKG(true, "")
 
 	recordReconcile(d.status, nil)
 
@@ -352,13 +349,7 @@ func (d *Daemon) runHealthChecks(ctx context.Context) {
 		result := d.healthChecker.RunCheck(svc, bridgeIP)
 
 		// Write result back to status so the GUI shows health state.
-		healthy := result.Healthy
-		for i := range d.status.Containers {
-			if d.status.Containers[i].Name == svc.Name {
-				d.status.Containers[i].Healthy = &healthy
-				break
-			}
-		}
+		d.status.setContainerHealth(svc.Name, result.Healthy)
 
 		if d.metrics != nil {
 			outcome := "pass"

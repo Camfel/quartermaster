@@ -41,9 +41,10 @@ vet:
 test:
 	go test -v -count=1 ./pkg/...
 
-# Unit tests with race detector enabled.
+# Unit tests with race detector enabled, across every package (including
+# internal/daemon, which has the status-API concurrency test).
 test-race:
-	go test -race -count=1 ./pkg/...
+	go test -race -count=1 ./...
 
 # Optimised debug build (keeps symbol tables for profiling).
 build:

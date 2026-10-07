@@ -9,6 +9,8 @@ jobs:
         with:
           go-version: '1.26'
       - run: make all
+      - name: Race detector
+        run: make test-race
       - name: govulncheck
         # Non-blocking: three containerd v1.7.x CRI checkpoint issues have no
         # 1.7.x fix and are unreachable from this client. Flip to blocking once

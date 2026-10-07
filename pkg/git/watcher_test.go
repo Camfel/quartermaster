@@ -56,8 +56,9 @@ func TestWatcher_Start(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	changedCalled := false
-	var detectedHash string
+	// The watcher invokes the callback from its own goroutine; pass the value
+	// over a channel so there is no unsynchronized shared variable.
+	changedCh := make(chan string, 1)
 
 	watcher := NewWatcher(
 		"file://"+remoteDir,
@@ -69,8 +70,10 @@ func TestWatcher_Start(t *testing.T) {
 		500*time.Millisecond,
 		0,
 		func(ctx context.Context, newHash string) {
-			changedCalled = true
-			detectedHash = newHash
+			select {
+			case changedCh <- newHash:
+			default:
+			}
 		},
 	)
 
@@ -98,12 +101,14 @@ func TestWatcher_Start(t *testing.T) {
 	require.NoError(t, err, "local repo should have the new commit")
 	log.Printf("Local repo hash after push: %s", string(out))
 
-	// Wait for watcher to detect it
-	require.Eventually(t, func() bool {
-		return changedCalled
-	}, 10*time.Second, 100*time.Millisecond)
-
-	assert.True(t, changedCalled)
+	// Wait for the watcher to detect it.  Receiving from changedCh
+	// synchronizes the callback's write with this read.
+	var detectedHash string
+	select {
+	case detectedHash = <-changedCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for watcher to detect the new commit")
+	}
 	assert.NotEmpty(t, detectedHash)
 
 	// Cleanup
