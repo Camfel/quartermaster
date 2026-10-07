@@ -637,7 +637,7 @@ func TestMergeStacks_LaterWins(t *testing.T) {
 		Kind:     "Stack",
 		Metadata: types.Metadata{Name: "user"},
 		Spec: types.StackSpec{Services: []types.Service{
-			{Name: "shared", Image: "user:v2"},
+			{Name: "shared", Image: "user:v2", Network: "internal"},
 			{Name: "user-only", Image: "user:v1"},
 		}},
 	}
@@ -656,6 +656,16 @@ func TestMergeStacks_LaterWins(t *testing.T) {
 	}
 	if byName["shared"] != "user:v2" {
 		t.Errorf("expected the later stack to override 'shared', got %q", byName["shared"])
+	}
+	// The whole service is replaced, not just the image.
+	var shared *types.Service
+	for i := range merged.Spec.Services {
+		if merged.Spec.Services[i].Name == "shared" {
+			shared = &merged.Spec.Services[i]
+		}
+	}
+	if shared == nil || shared.Network != "internal" {
+		t.Errorf("expected the later stack's full definition, got %+v", shared)
 	}
 	if byName["base-only"] != "base:v1" {
 		t.Errorf("base-only service should be preserved, got %q", byName["base-only"])

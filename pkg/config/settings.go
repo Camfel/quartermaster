@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -308,16 +309,21 @@ func (s *Settings) StackFiles() []string {
 	seen := make(map[string]bool)
 	var paths []string
 
-	// Components first (user repos override on name conflict).
+	// Components first (user repos override on name conflict).  Component
+	// entries come from a map, so sort within the group for a deterministic
+	// order without disturbing the component-before-repo grouping.
+	var componentPaths []string
 	for _, r := range s.ExpandComponents() {
 		p := r.StackPath()
 		if !seen[p] {
 			seen[p] = true
-			paths = append(paths, p)
+			componentPaths = append(componentPaths, p)
 		}
 	}
+	sort.Strings(componentPaths)
+	paths = append(paths, componentPaths...)
 
-	// Then user repos.
+	// Then user repos, in configuration order.
 	for _, r := range s.Repos {
 		p := r.StackPath()
 		if !seen[p] {
