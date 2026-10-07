@@ -52,6 +52,21 @@ func TestRecordContainerStats(t *testing.T) {
 	if strings.Contains(body, `service="svc-b"`) {
 		t.Errorf("expected svc-b series to be reset, got:\n%s", body)
 	}
+
+	// svc-b is recreated, then removed from the manifest entirely: its series
+	// must still be dropped rather than lingering until restart.
+	d.recordContainerStats(context.Background(), []cri.ContainerInfo{
+		{ID: "a", Name: "svc-a", Running: true},
+		{ID: "b", Name: "svc-b", Running: true},
+	}, stack)
+	d.recordContainerStats(context.Background(), []cri.ContainerInfo{
+		{ID: "a", Name: "svc-a", Running: true},
+	}, &types.Stack{Spec: types.StackSpec{Services: []types.Service{{Name: "svc-a"}}}})
+
+	body = scrape(t, m)
+	if strings.Contains(body, `service="svc-b"`) {
+		t.Errorf("expected removed svc-b series to be dropped, got:\n%s", body)
+	}
 }
 
 func TestUpdateUnhealthyMetric(t *testing.T) {

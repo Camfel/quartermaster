@@ -9,7 +9,7 @@ All notable changes to Quartermaster.
 - Gotify push notification integration for critical alerts
 - Caddy reverse proxy with automatic TLS (Let's Encrypt)
 - Tailscale component for VPN-free remote access
-- Container logging with automatic rotation
+- Container logging to persistent per-container log files
 - ConfigMap system for user-overridable component defaults
 - `command:` field support for container startup wrappers
 - Gateway IP tracking with automatic dependent recreation
@@ -20,12 +20,14 @@ All notable changes to Quartermaster.
 - DNS forwarder resolves unknown short hostnames to bridge gateway
 - Metrics use `v2.Memory.Anon` (RSS) instead of `v2.Memory.Usage` (includes page cache)
 - `/etc/hosts` entries use bridge gateway IP (`10.42.0.1`) for host-networked services
+- Container CPU is exposed as the gauge `qm_container_cpu_seconds` (was the counter `qm_container_cpu_seconds_total`, which double-counted the cumulative value)
 
 ### Fixed
 - Stale DNAT rule accumulation from `ruleToDeleteArgs` skipping protocol values
 - Service renames now properly clean up old containers
 - `Detach` always attempts cleanup regardless of profile parameter
 - DNAT OUTPUT chain rules added for host-local access to forwarded ports
+- `qm_containers_unhealthy`, `qm_bridge_ips_used`/`_free`, `qm_lkg_healthy`, and per-container CPU/memory metrics are now updated (previously registered but never written)
 
 ## [0.1.0] - 2026-05-15
 
