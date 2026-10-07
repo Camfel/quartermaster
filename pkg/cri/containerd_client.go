@@ -28,6 +28,7 @@ import (
 	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/oci"
+	"github.com/containerd/errdefs"
 	gogoproto "github.com/gogo/protobuf/proto"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -101,76 +102,6 @@ func (ls *logStore) remove(containerID string) {
 	delete(ls.bufs, containerID)
 }
 
-// ── Persistent log file with rotation ──────────────────────────────────
-
-// rotatingFile writes to a log file, rotating when it exceeds maxBytes.
-// Safe for concurrent use by a single writer (container stdout/stderr).
-type rotatingFile struct {
-	dir      string
-	maxBytes int64
-	maxFiles int
-	mu       sync.Mutex
-	file     *os.File
-	written  int64
-}
-
-func newRotatingFile(dir string, maxBytes int64, maxFiles int) (*rotatingFile, error) {
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, err
-	}
-	rf := &rotatingFile{dir: dir, maxBytes: maxBytes, maxFiles: maxFiles}
-	if err := rf.open(); err != nil {
-		return nil, err
-	}
-	return rf, nil
-}
-
-func (rf *rotatingFile) open() error {
-	path := filepath.Join(rf.dir, "current.log")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-	fi, _ := f.Stat()
-	rf.file = f
-	rf.written = fi.Size()
-	return nil
-}
-
-func (rf *rotatingFile) Write(p []byte) (int, error) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	if rf.written+int64(len(p)) > rf.maxBytes && rf.maxBytes > 0 {
-		rf.rotate()
-	}
-	n, err := rf.file.Write(p)
-	rf.written += int64(n)
-	return n, err
-}
-
-func (rf *rotatingFile) rotate() {
-	rf.file.Close()
-	for i := rf.maxFiles - 1; i >= 1; i-- {
-		old := filepath.Join(rf.dir, fmt.Sprintf("current.%d.log", i))
-		new := filepath.Join(rf.dir, fmt.Sprintf("current.%d.log", i+1))
-		os.Rename(old, new)
-	}
-	current := filepath.Join(rf.dir, "current.log")
-	first := filepath.Join(rf.dir, "current.1.log")
-	os.Rename(current, first)
-	rf.open()
-}
-
-func (rf *rotatingFile) Close() error {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if rf.file != nil {
-		return rf.file.Close()
-	}
-	return nil
-}
-
 // ContainerdClient is the real implementation of ContainerClient using containerd.
 type ContainerdClient struct {
 	client    *containerd.Client
@@ -185,6 +116,51 @@ type ContainerdClient struct {
 	// mountCleanups tracks tmp directories created for secret mounts.
 	// Keyed by container ID, called on DeleteContainer.
 	mountCleanups map[string]func()
+
+	// mountMu guards mountCleanups.  CreateContainer runs on the reconcile
+	// goroutine while DeleteContainer is also reachable from status-API
+	// goroutines, so access must be synchronized.
+	mountMu sync.Mutex
+
+	// logMu guards logFiles, the per-container persistent log handles that
+	// must be closed when the container is deleted.
+	logMu    sync.Mutex
+	logFiles map[string]*os.File
+}
+
+// setMountCleanup registers a cleanup function for a container's mounts.
+func (c *ContainerdClient) setMountCleanup(containerID string, fn func()) {
+	c.mountMu.Lock()
+	defer c.mountMu.Unlock()
+	c.mountCleanups[containerID] = fn
+}
+
+// takeMountCleanup removes and returns the cleanup registered for a container.
+func (c *ContainerdClient) takeMountCleanup(containerID string) (func(), bool) {
+	c.mountMu.Lock()
+	defer c.mountMu.Unlock()
+	fn, ok := c.mountCleanups[containerID]
+	if ok {
+		delete(c.mountCleanups, containerID)
+	}
+	return fn, ok
+}
+
+// setLogFile records the open persistent log file for a container.
+func (c *ContainerdClient) setLogFile(containerID string, f *os.File) {
+	c.logMu.Lock()
+	defer c.logMu.Unlock()
+	c.logFiles[containerID] = f
+}
+
+// closeLogFile closes and forgets the persistent log file for a container.
+func (c *ContainerdClient) closeLogFile(containerID string) {
+	c.logMu.Lock()
+	defer c.logMu.Unlock()
+	if f, ok := c.logFiles[containerID]; ok {
+		f.Close()
+		delete(c.logFiles, containerID)
+	}
 }
 
 // NewContainerdClient initializes a new connection to the containerd socket.
@@ -199,6 +175,7 @@ func NewContainerdClient(socketPath, namespace string) (*ContainerdClient, error
 		namespace:     namespace,
 		logs:          newLogStore(),
 		mountCleanups: make(map[string]func()),
+		logFiles:      make(map[string]*os.File),
 	}, nil
 }
 
@@ -470,12 +447,17 @@ func (c *ContainerdClient) CreateContainer(ctx context.Context, svc types.Servic
 		if secretCleanup != nil {
 			secretCleanup()
 		}
+		// Attach already created a netns/veth/DNAT for this service; without
+		// a container to own them they would leak.
+		if !useHostNet && c.netMgr != nil {
+			c.netMgr.Detach(svc.Name, netProfile)
+		}
 		return "", fmt.Errorf("failed to create container %s: %w", svc.Name, err)
 	}
 
 	// Store secret mount cleanup for when the container is deleted.
 	if secretCleanup != nil {
-		c.mountCleanups[container.ID()] = secretCleanup
+		c.setMountCleanup(container.ID(), secretCleanup)
 	}
 
 	return container.ID(), nil
@@ -511,19 +493,30 @@ func (c *ContainerdClient) StartContainer(ctx context.Context, containerID strin
 
 	rb := c.logs.get(containerID)
 	var logWriter io.Writer = rb
+	var logFile *os.File
 
-	// Also persist logs to a file so they survive daemon restarts.
+	// Also persist logs to a file so they survive daemon restarts.  0600:
+	// container output can contain credentials.
 	if c.logDir != "" {
-		if err := os.MkdirAll(c.logDir, 0755); err != nil {
+		if err := os.MkdirAll(c.logDir, 0750); err != nil {
 			log.Printf("Warning: cannot create log dir %s: %v", c.logDir, err)
 		} else {
 			logPath := filepath.Join(c.logDir, containerID+".log")
-			lf, lfErr := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+			lf, lfErr := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 			if lfErr != nil {
 				log.Printf("Warning: cannot open log file %s: %v", logPath, lfErr)
 			} else {
+				logFile = lf
 				logWriter = io.MultiWriter(rb, lf)
 			}
+		}
+	}
+
+	// Close the log handle on any failure path so it is never leaked.  On
+	// success it is tracked and closed by DeleteContainer.
+	closeLog := func() {
+		if logFile != nil {
+			logFile.Close()
 		}
 	}
 
@@ -550,17 +543,23 @@ func (c *ContainerdClient) StartContainer(ctx context.Context, containerID strin
 				logWriter,
 			)))
 			if err != nil {
+				closeLog()
 				return fmt.Errorf("failed to create task for container %s (after cleanup): %w", containerID, err)
 			}
 		} else {
+			closeLog()
 			return fmt.Errorf("failed to create task for container %s: %w", containerID, err)
 		}
 	}
 
 	if err := task.Start(ctx); err != nil {
+		closeLog()
 		return fmt.Errorf("failed to start task for container %s: %w", containerID, err)
 	}
 
+	if logFile != nil {
+		c.setLogFile(containerID, logFile)
+	}
 	return nil
 }
 
@@ -764,11 +763,11 @@ func (c *ContainerdClient) StopContainer(ctx context.Context, containerID string
 // DeleteContainer removes the container and its resources.
 func (c *ContainerdClient) DeleteContainer(ctx context.Context, containerID string) error {
 	c.logs.remove(containerID)
+	c.closeLogFile(containerID)
 
 	// Clean up any secret/ConfigMap tmp directories.
-	if cleanup, ok := c.mountCleanups[containerID]; ok {
+	if cleanup, ok := c.takeMountCleanup(containerID); ok {
 		cleanup()
-		delete(c.mountCleanups, containerID)
 	}
 
 	ctx = c.withNamespace(ctx)
@@ -776,6 +775,11 @@ func (c *ContainerdClient) DeleteContainer(ctx context.Context, containerID stri
 
 	container, err := c.client.LoadContainer(ctx, containerID)
 	if err != nil {
+		// Idempotent: an already-removed container is a successful delete.
+		if errdefs.IsNotFound(err) {
+			log.Printf("Container %s already removed", containerID)
+			return nil
+		}
 		return fmt.Errorf("failed to load container %s: %w", containerID, err)
 	}
 
@@ -784,6 +788,9 @@ func (c *ContainerdClient) DeleteContainer(ctx context.Context, containerID stri
 	}
 
 	if err := container.Delete(ctx, containerd.WithSnapshotCleanup); err != nil {
+		if errdefs.IsNotFound(err) {
+			return nil
+		}
 		return fmt.Errorf("failed to delete container %s: %w", containerID, err)
 	}
 

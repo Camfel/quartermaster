@@ -232,6 +232,11 @@ func (r *Reconciler) runCreateFlow(ctx context.Context, svc types.Service, runni
 
 	// 3. Start Container
 	if err := r.containerClient.StartContainer(ctx, containerID); err != nil {
+		// Roll back the created container and its network resources so a
+		// failed start does not leave orphans behind.
+		if delErr := r.runDeleteFlow(ctx, containerID, svc.Name); delErr != nil {
+			log.Printf("Warning: cleanup after failed start of %s: %v", svc.Name, delErr)
+		}
 		return "", fmt.Errorf("start failed: %w", err)
 	}
 
