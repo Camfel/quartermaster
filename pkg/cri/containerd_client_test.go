@@ -2,6 +2,7 @@ package cri
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -9,7 +10,7 @@ import (
 )
 
 func TestCloseLogFile(t *testing.T) {
-	c := &ContainerdClient{logFiles: make(map[string]*os.File)}
+	c := &ContainerdClient{logFiles: make(map[string]io.Closer)}
 
 	f, err := os.OpenFile(filepath.Join(t.TempDir(), "c.log"), os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
@@ -34,7 +35,7 @@ func TestCloseLogFile(t *testing.T) {
 func TestLifecycleHelpersConcurrent(t *testing.T) {
 	c := &ContainerdClient{
 		mountCleanups: make(map[string]func()),
-		logFiles:      make(map[string]*os.File),
+		logFiles:      make(map[string]io.Closer),
 	}
 	dir := t.TempDir()
 
@@ -78,5 +79,47 @@ func TestTakeMountCleanup(t *testing.T) {
 	}
 	if _, ok := c.takeMountCleanup("abc"); ok {
 		t.Error("cleanup should only be handed out once")
+	}
+}
+
+func TestRotatingLog(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.log")
+	rl, err := newRotatingLog(path, 10, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rl.Close()
+
+	for i := 0; i < 5; i++ {
+		if _, err := rl.Write([]byte("0123456789")); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	// Active file plus two backups.
+	for _, suffix := range []string{"", ".1", ".2"} {
+		if _, err := os.Stat(path + suffix); err != nil {
+			t.Errorf("expected %s to exist: %v", path+suffix, err)
+		}
+	}
+	if _, err := os.Stat(path + ".3"); !os.IsNotExist(err) {
+		t.Error("expected only two rotated backups")
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() > 10 {
+		t.Errorf("active log exceeds maxBytes: %d", fi.Size())
+	}
+
+	// Rotation must not lose the active file's contents.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) == 0 {
+		t.Error("active log should contain the most recent writes")
 	}
 }
