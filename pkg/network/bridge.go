@@ -173,14 +173,6 @@ func (b *BridgeManager) Attach(serviceName string, profile string, vpnGateway st
 
 	// ── Allocate IP ───────────────────────────────────────────────
 	b.mu.Lock()
-	// Netns and veth names are limited to 8 significant characters.  Two
-	// services sharing them would share a namespace, and this Attach would
-	// tear down the other service's networking, so refuse rather than corrupt.
-	if other, collision := shortNameCollision(b.ips, serviceName); collision {
-		b.mu.Unlock()
-		return NetInfo{}, fmt.Errorf("service %q collides with %q on network identifier %q; rename one of them",
-			serviceName, other, ShortName(serviceName))
-	}
 	ip, err := b.allocateIPLocked(serviceName)
 	if err == nil {
 		b.saveIPs()
@@ -1166,23 +1158,10 @@ func addrExistsOnLink(linkName, ip string) bool {
 	return false
 }
 
-// shortNameCollision returns the name of a different service that maps to the
-// same 8-character network identifier as serviceName.  The caller must hold
-// b.mu.
-func shortNameCollision(ips map[string]net.IP, serviceName string) (string, bool) {
-	short := ShortName(serviceName)
-	for name := range ips {
-		if name != serviceName && ShortName(name) == short {
-			return name, true
-		}
-	}
-	return "", false
-}
-
 // ShortName truncates a name to 8 characters for interface and namespace
 // naming.  Names longer than 8 characters can collide (e.g. "jellyfin-web"
-// and "jellyfin-api"); Attach rejects such collisions rather than letting one
-// service tear down the other's network.
+// and "jellyfin-api"); ValidateShortNames rejects such configurations before
+// any namespace is created.
 func ShortName(name string) string {
 	if name == "" {
 		return "ctr"

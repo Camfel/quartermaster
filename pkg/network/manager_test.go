@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"testing"
+
+	"quartermaster/pkg/types"
 )
 
 func TestValidProfile(t *testing.T) {
@@ -295,21 +297,30 @@ func TestRuleFieldExactMatch(t *testing.T) {
 	}
 }
 
-func TestShortNameCollision(t *testing.T) {
-	ips := map[string]net.IP{
-		"jellyfin-web": net.ParseIP("10.42.0.2"),
+func TestValidateShortNames(t *testing.T) {
+	// Namespaced services sharing the first 8 characters are rejected.
+	err := ValidateShortNames([]types.Service{
+		{Name: "jellyfin-web", Network: "internal"},
+		{Name: "jellyfin-api", Network: "vpn"},
+	})
+	if err == nil {
+		t.Error("expected a collision error for jellyfin-web/jellyfin-api")
 	}
 
-	// Two services sharing the first 8 characters collide.
-	if other, ok := shortNameCollision(ips, "jellyfin-api"); !ok || other != "jellyfin-web" {
-		t.Errorf("expected collision with jellyfin-web, got %q, %v", other, ok)
+	// Distinct short names are fine.
+	if err := ValidateShortNames([]types.Service{
+		{Name: "sonarr", Network: "internal"},
+		{Name: "radarr", Network: "internal"},
+	}); err != nil {
+		t.Errorf("unexpected error: %v", err)
 	}
-	// A service never collides with itself (matters on recreate).
-	if _, ok := shortNameCollision(ips, "jellyfin-web"); ok {
-		t.Error("a service must not collide with itself")
-	}
-	// Distinct short names do not collide.
-	if _, ok := shortNameCollision(ips, "sonarr"); ok {
-		t.Error("sonarr should not collide with jellyfin-web")
+
+	// Host-networked (public) services have no namespace and may share a
+	// prefix.
+	if err := ValidateShortNames([]types.Service{
+		{Name: "jellyfin-web", Network: "public"},
+		{Name: "jellyfin-api"}, // empty network defaults to public
+	}); err != nil {
+		t.Errorf("public services must not collide, got: %v", err)
 	}
 }
