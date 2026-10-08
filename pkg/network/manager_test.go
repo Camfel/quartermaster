@@ -294,3 +294,22 @@ func TestRuleFieldExactMatch(t *testing.T) {
 		t.Errorf("ruleField(--dport) = (%q,%v), want (8080,true)", got, ok)
 	}
 }
+
+func TestShortNameCollision(t *testing.T) {
+	ips := map[string]net.IP{
+		"jellyfin-web": net.ParseIP("10.42.0.2"),
+	}
+
+	// Two services sharing the first 8 characters collide.
+	if other, ok := shortNameCollision(ips, "jellyfin-api"); !ok || other != "jellyfin-web" {
+		t.Errorf("expected collision with jellyfin-web, got %q, %v", other, ok)
+	}
+	// A service never collides with itself (matters on recreate).
+	if _, ok := shortNameCollision(ips, "jellyfin-web"); ok {
+		t.Error("a service must not collide with itself")
+	}
+	// Distinct short names do not collide.
+	if _, ok := shortNameCollision(ips, "sonarr"); ok {
+		t.Error("sonarr should not collide with jellyfin-web")
+	}
+}
