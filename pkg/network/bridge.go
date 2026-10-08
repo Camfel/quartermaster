@@ -1158,7 +1158,10 @@ func addrExistsOnLink(linkName, ip string) bool {
 	return false
 }
 
-// ShortName truncates a name to 8 characters for interface naming.
+// ShortName truncates a name to 8 characters for interface and namespace
+// naming.  Names longer than 8 characters can collide (e.g. "jellyfin-web"
+// and "jellyfin-api"); ValidateShortNames rejects such configurations before
+// any namespace is created.
 func ShortName(name string) string {
 	if name == "" {
 		return "ctr"

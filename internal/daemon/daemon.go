@@ -524,36 +524,41 @@ func (d *Daemon) loadMergedStack() (*types.Stack, error) {
 		return nil, err
 	}
 
-	settings, sErr := config.LoadSettings(d.settingsPath)
-	if sErr != nil {
-		return primary, nil // settings not available — use primary stack only
+	merged := primary
+	if settings, sErr := config.LoadSettings(d.settingsPath); sErr == nil {
+		// StackFiles() returns component stacks first and user repos last, so
+		// a later merge overrides an earlier one.  Do NOT sort the whole list:
+		// that grouping is the precedence order.  Merge the primary (main user)
+		// stack last so customisations in it always win over component/repo
+		// defaults.
+		var base *types.Stack
+		for _, f := range settings.StackFiles() {
+			if f == d.stackFile {
+				continue // applied last as the primary stack
+			}
+			additional, aErr := d.configManager.LoadStack(f)
+			if aErr != nil {
+				log.Printf("Warning: skipping stack %s: %v", f, aErr)
+				continue
+			}
+			if base == nil {
+				base = additional
+			} else {
+				base = d.configManager.MergeStacks(base, additional)
+			}
+		}
+		if base != nil {
+			merged = d.configManager.MergeStacks(base, primary)
+		}
 	}
 
-	// StackFiles() returns component stacks first and user repos last, so a
-	// later merge overrides an earlier one.  Do NOT sort the whole list: that
-	// grouping is the precedence order.  Merge the primary (main user) stack
-	// last so customisations in it always win over component/repo defaults.
-	files := settings.StackFiles()
-	var merged *types.Stack
-	for _, f := range files {
-		if f == d.stackFile {
-			continue // applied last as the primary stack
-		}
-		additional, aErr := d.configManager.LoadStack(f)
-		if aErr != nil {
-			log.Printf("Warning: skipping stack %s: %v", f, aErr)
-			continue
-		}
-		if merged == nil {
-			merged = additional
-		} else {
-			merged = d.configManager.MergeStacks(merged, additional)
-		}
+	// Reject configurations where two namespaced services share an 8-char
+	// network identifier before any namespace is created; otherwise Attach
+	// would tear down the other service's networking.
+	if err := network.ValidateShortNames(merged.Spec.Services); err != nil {
+		return nil, err
 	}
-	if merged == nil {
-		return primary, nil
-	}
-	return d.configManager.MergeStacks(merged, primary), nil
+	return merged, nil
 }
 
 // reload re-reads the settings file and updates the daemon's stack file path.

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"testing"
+
+	"quartermaster/pkg/types"
 )
 
 func TestValidProfile(t *testing.T) {
@@ -292,5 +294,33 @@ func TestRuleFieldExactMatch(t *testing.T) {
 	rule := "-A PREROUTING -p tcp -m tcp --dport 8080 -j DNAT --to-destination 10.42.0.5:80"
 	if got, ok := ruleField(rule, "--dport"); !ok || got != "8080" {
 		t.Errorf("ruleField(--dport) = (%q,%v), want (8080,true)", got, ok)
+	}
+}
+
+func TestValidateShortNames(t *testing.T) {
+	// Namespaced services sharing the first 8 characters are rejected.
+	err := ValidateShortNames([]types.Service{
+		{Name: "jellyfin-web", Network: "internal"},
+		{Name: "jellyfin-api", Network: "vpn"},
+	})
+	if err == nil {
+		t.Error("expected a collision error for jellyfin-web/jellyfin-api")
+	}
+
+	// Distinct short names are fine.
+	if err := ValidateShortNames([]types.Service{
+		{Name: "sonarr", Network: "internal"},
+		{Name: "radarr", Network: "internal"},
+	}); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	// Host-networked (public) services have no namespace and may share a
+	// prefix.
+	if err := ValidateShortNames([]types.Service{
+		{Name: "jellyfin-web", Network: "public"},
+		{Name: "jellyfin-api"}, // empty network defaults to public
+	}); err != nil {
+		t.Errorf("public services must not collide, got: %v", err)
 	}
 }

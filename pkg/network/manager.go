@@ -52,6 +52,26 @@ func NormaliseProfile(p string) Profile {
 	return Profile(strings.ToLower(p))
 }
 
+// ValidateShortNames returns an error if two services that get their own
+// network namespace share the same 8-character network identifier.  Such a
+// collision would make Attach tear down the other service's namespace, so the
+// configuration is rejected up front.  Host-networked (public) services have
+// no namespace and are ignored.
+func ValidateShortNames(services []types.Service) error {
+	seen := make(map[string]string, len(services))
+	for _, svc := range services {
+		if NormaliseProfile(svc.Network) == ProfilePublic {
+			continue
+		}
+		short := ShortName(svc.Name)
+		if other, ok := seen[short]; ok {
+			return fmt.Errorf("services %q and %q share the network identifier %q; rename one of them", other, svc.Name, short)
+		}
+		seen[short] = svc.Name
+	}
+	return nil
+}
+
 // ── NetInfo ─────────────────────────────────────────────────────────────
 
 // NetInfo is returned by Attach and describes the network configuration
