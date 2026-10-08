@@ -106,6 +106,12 @@ func (ls *logStore) remove(containerID string) {
 // When the active file would exceed maxBytes it is rotated to <path>.1 and
 // older backups are shifted, keeping at most maxFiles backups.  Safe for
 // concurrent use; the container runtime writes stdout and stderr through it.
+//
+// A log-file failure (full disk, read-only mount, failed rename) is never
+// fatal: Write swallows it and returns success so io.MultiWriter does not
+// abort the runtime's stdout copy goroutine and take the in-memory log buffer
+// down with it.  maxFiles <= 0 keeps no backups (the active file is
+// truncated); maxBytes <= 0 disables rotation.
 type rotatingLog struct {
 	path     string
 	maxBytes int64
@@ -118,13 +124,15 @@ type rotatingLog struct {
 
 func newRotatingLog(path string, maxBytes int64, maxFiles int) (*rotatingLog, error) {
 	rl := &rotatingLog{path: path, maxBytes: maxBytes, maxFiles: maxFiles}
-	if err := rl.open(); err != nil {
+	if err := rl.openLocked(); err != nil {
 		return nil, err
 	}
 	return rl, nil
 }
 
-func (rl *rotatingLog) open() error {
+// openLocked opens (creating if needed) the active log file.  The caller must
+// hold rl.mu (or own the writer exclusively, as newRotatingLog does).
+func (rl *rotatingLog) openLocked() error {
 	if err := os.MkdirAll(filepath.Dir(rl.path), 0750); err != nil {
 		return err
 	}
@@ -149,22 +157,48 @@ func (rl *rotatingLog) Write(p []byte) (int, error) {
 	defer rl.mu.Unlock()
 
 	if rl.maxBytes > 0 && rl.written+int64(len(p)) > rl.maxBytes {
-		if err := rl.rotate(); err != nil {
-			// Keep writing to the current file rather than dropping output.
+		if err := rl.rotateLocked(); err != nil {
 			log.Printf("Warning: log rotation for %s failed: %v", rl.path, err)
 		}
 	}
+	// rotateLocked may have left us without a file (a failed rotation).
+	if rl.file == nil {
+		if err := rl.openLocked(); err != nil {
+			log.Printf("Warning: cannot reopen log %s: %v", rl.path, err)
+			return len(p), nil
+		}
+	}
+
 	n, err := rl.file.Write(p)
 	rl.written += int64(n)
-	return n, err
+	if err != nil {
+		log.Printf("Warning: write to log %s failed: %v", rl.path, err)
+		return len(p), nil
+	}
+	return n, nil
 }
 
-// rotate closes the active file, shifts backups, and starts a fresh one.
-// The caller must hold rl.mu.
-func (rl *rotatingLog) rotate() error {
-	if err := rl.file.Close(); err != nil {
-		return err
+// rotateLocked rotates the active file.  It always leaves rl.file either a
+// valid open handle or nil (never a closed one), so Write can recover.  The
+// caller must hold rl.mu.
+func (rl *rotatingLog) rotateLocked() error {
+	if rl.file != nil {
+		rl.file.Close()
+		rl.file = nil
 	}
+
+	if rl.maxFiles <= 0 {
+		// No backups requested: start over in place.
+		if err := rl.openLocked(); err != nil {
+			return err
+		}
+		if err := rl.file.Truncate(0); err != nil {
+			return err
+		}
+		rl.written = 0
+		return nil
+	}
+
 	// Drop the oldest backup by shifting down: .(n-1) -> .n.
 	for i := rl.maxFiles - 1; i >= 1; i-- {
 		_ = os.Rename(fmt.Sprintf("%s.%d", rl.path, i), fmt.Sprintf("%s.%d", rl.path, i+1))
@@ -172,16 +206,18 @@ func (rl *rotatingLog) rotate() error {
 	if err := os.Rename(rl.path, rl.path+".1"); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	return rl.open()
+	return rl.openLocked()
 }
 
 func (rl *rotatingLog) Close() error {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	if rl.file != nil {
-		return rl.file.Close()
+	if rl.file == nil {
+		return nil
 	}
-	return nil
+	err := rl.file.Close()
+	rl.file = nil
+	return err
 }
 
 // ContainerdClient is the real implementation of ContainerClient using containerd.

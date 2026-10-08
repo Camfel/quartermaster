@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -113,6 +114,9 @@ func TestRotatingLog(t *testing.T) {
 	if fi.Size() > 10 {
 		t.Errorf("active log exceeds maxBytes: %d", fi.Size())
 	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("expected log mode 0600, got %o", fi.Mode().Perm())
+	}
 
 	// Rotation must not lose the active file's contents.
 	data, err := os.ReadFile(path)
@@ -121,5 +125,35 @@ func TestRotatingLog(t *testing.T) {
 	}
 	if len(data) == 0 {
 		t.Error("active log should contain the most recent writes")
+	}
+}
+
+func TestRotatingLogSurvivesRotationFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.log")
+	rl, err := newRotatingLog(path, 1, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rl.Close()
+
+	// Occupy the rotation destination with a directory so the rename fails.
+	if err := os.Mkdir(path+".1", 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Neither write may return an error: a failed rotation must not kill the
+	// io.MultiWriter chain used for container logging.
+	for _, s := range []string{"hello", "world"} {
+		if _, err := rl.Write([]byte(s)); err != nil {
+			t.Fatalf("write %q after failed rotation returned error: %v", s, err)
+		}
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "world") {
+		t.Errorf("expected writes to persist after a failed rotation, got %q", data)
 	}
 }
