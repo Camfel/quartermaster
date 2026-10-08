@@ -9,7 +9,7 @@ All notable changes to Quartermaster.
 - Gotify push notification integration for critical alerts
 - Caddy reverse proxy with automatic TLS (Let's Encrypt)
 - Tailscale component for VPN-free remote access
-- Container logging to persistent per-container log files
+- Container logging to persistent per-container log files, size-rotated (10 MiB active file, 3 backups)
 - ConfigMap system for user-overridable component defaults
 - `command:` field support for container startup wrappers
 - Gateway IP tracking with automatic dependent recreation

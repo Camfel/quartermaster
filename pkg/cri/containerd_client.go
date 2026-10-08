@@ -102,6 +102,124 @@ func (ls *logStore) remove(containerID string) {
 	delete(ls.bufs, containerID)
 }
 
+// rotatingLog is a size-bounded writer for one container's persistent log.
+// When the active file would exceed maxBytes it is rotated to <path>.1 and
+// older backups are shifted, keeping at most maxFiles backups.  Safe for
+// concurrent use; the container runtime writes stdout and stderr through it.
+//
+// A log-file failure (full disk, read-only mount, failed rename) is never
+// fatal: Write swallows it and returns success so io.MultiWriter does not
+// abort the runtime's stdout copy goroutine and take the in-memory log buffer
+// down with it.  maxFiles <= 0 keeps no backups (the active file is
+// truncated); maxBytes <= 0 disables rotation.
+type rotatingLog struct {
+	path     string
+	maxBytes int64
+	maxFiles int
+
+	mu      sync.Mutex
+	file    *os.File
+	written int64
+}
+
+func newRotatingLog(path string, maxBytes int64, maxFiles int) (*rotatingLog, error) {
+	rl := &rotatingLog{path: path, maxBytes: maxBytes, maxFiles: maxFiles}
+	if err := rl.openLocked(); err != nil {
+		return nil, err
+	}
+	return rl, nil
+}
+
+// openLocked opens (creating if needed) the active log file.  The caller must
+// hold rl.mu (or own the writer exclusively, as newRotatingLog does).
+func (rl *rotatingLog) openLocked() error {
+	if err := os.MkdirAll(filepath.Dir(rl.path), 0750); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(rl.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	// Tighten files created by older versions with 0644.
+	_ = f.Chmod(0600)
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return err
+	}
+	rl.file = f
+	rl.written = fi.Size()
+	return nil
+}
+
+func (rl *rotatingLog) Write(p []byte) (int, error) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	if rl.maxBytes > 0 && rl.written+int64(len(p)) > rl.maxBytes {
+		if err := rl.rotateLocked(); err != nil {
+			log.Printf("Warning: log rotation for %s failed: %v", rl.path, err)
+		}
+	}
+	// rotateLocked may have left us without a file (a failed rotation).
+	if rl.file == nil {
+		if err := rl.openLocked(); err != nil {
+			log.Printf("Warning: cannot reopen log %s: %v", rl.path, err)
+			return len(p), nil
+		}
+	}
+
+	n, err := rl.file.Write(p)
+	rl.written += int64(n)
+	if err != nil {
+		log.Printf("Warning: write to log %s failed: %v", rl.path, err)
+		return len(p), nil
+	}
+	return n, nil
+}
+
+// rotateLocked rotates the active file.  It always leaves rl.file either a
+// valid open handle or nil (never a closed one), so Write can recover.  The
+// caller must hold rl.mu.
+func (rl *rotatingLog) rotateLocked() error {
+	if rl.file != nil {
+		rl.file.Close()
+		rl.file = nil
+	}
+
+	if rl.maxFiles <= 0 {
+		// No backups requested: start over in place.
+		if err := rl.openLocked(); err != nil {
+			return err
+		}
+		if err := rl.file.Truncate(0); err != nil {
+			return err
+		}
+		rl.written = 0
+		return nil
+	}
+
+	// Drop the oldest backup by shifting down: .(n-1) -> .n.
+	for i := rl.maxFiles - 1; i >= 1; i-- {
+		_ = os.Rename(fmt.Sprintf("%s.%d", rl.path, i), fmt.Sprintf("%s.%d", rl.path, i+1))
+	}
+	if err := os.Rename(rl.path, rl.path+".1"); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return rl.openLocked()
+}
+
+func (rl *rotatingLog) Close() error {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	if rl.file == nil {
+		return nil
+	}
+	err := rl.file.Close()
+	rl.file = nil
+	return err
+}
+
 // ContainerdClient is the real implementation of ContainerClient using containerd.
 type ContainerdClient struct {
 	client    *containerd.Client
@@ -122,11 +240,18 @@ type ContainerdClient struct {
 	// goroutines, so access must be synchronized.
 	mountMu sync.Mutex
 
-	// logMu guards logFiles, the per-container persistent log handles that
+	// logMu guards logFiles, the per-container persistent log writers that
 	// must be closed when the container is deleted.
 	logMu    sync.Mutex
-	logFiles map[string]*os.File
+	logFiles map[string]io.Closer
 }
+
+// Per-container persistent log rotation.  A single long-running container can
+// emit unbounded output, so the active file is capped and rotated.
+const (
+	defaultLogMaxBytes = 10 << 20 // 10 MiB active file
+	defaultLogMaxFiles = 3        // keep up to 3 rotated backups
+)
 
 // setMountCleanup registers a cleanup function for a container's mounts.
 func (c *ContainerdClient) setMountCleanup(containerID string, fn func()) {
@@ -146,9 +271,9 @@ func (c *ContainerdClient) takeMountCleanup(containerID string) (func(), bool) {
 	return fn, ok
 }
 
-// setLogFile records the open persistent log file for a container, closing
+// setLogFile records the open persistent log writer for a container, closing
 // any previous handle for the same ID so ownership stays unambiguous.
-func (c *ContainerdClient) setLogFile(containerID string, f *os.File) {
+func (c *ContainerdClient) setLogFile(containerID string, f io.Closer) {
 	c.logMu.Lock()
 	defer c.logMu.Unlock()
 	if prev, ok := c.logFiles[containerID]; ok {
@@ -157,7 +282,7 @@ func (c *ContainerdClient) setLogFile(containerID string, f *os.File) {
 	c.logFiles[containerID] = f
 }
 
-// closeLogFile closes and forgets the persistent log file for a container.
+// closeLogFile closes and forgets the persistent log writer for a container.
 func (c *ContainerdClient) closeLogFile(containerID string) {
 	c.logMu.Lock()
 	defer c.logMu.Unlock()
@@ -179,7 +304,7 @@ func NewContainerdClient(socketPath, namespace string) (*ContainerdClient, error
 		namespace:     namespace,
 		logs:          newLogStore(),
 		mountCleanups: make(map[string]func()),
-		logFiles:      make(map[string]*os.File),
+		logFiles:      make(map[string]io.Closer),
 	}, nil
 }
 
@@ -497,24 +622,18 @@ func (c *ContainerdClient) StartContainer(ctx context.Context, containerID strin
 
 	rb := c.logs.get(containerID)
 	var logWriter io.Writer = rb
-	var logFile *os.File
+	var logFile io.Closer
 
-	// Also persist logs to a file so they survive daemon restarts.  0600:
-	// container output can contain credentials.
+	// Also persist logs to a size-bounded file so they survive daemon restarts
+	// without growing without limit.  0600: output can contain credentials.
 	if c.logDir != "" {
-		if err := os.MkdirAll(c.logDir, 0750); err != nil {
-			log.Printf("Warning: cannot create log dir %s: %v", c.logDir, err)
+		logPath := filepath.Join(c.logDir, containerID+".log")
+		lf, lfErr := newRotatingLog(logPath, defaultLogMaxBytes, defaultLogMaxFiles)
+		if lfErr != nil {
+			log.Printf("Warning: cannot open log file %s: %v", logPath, lfErr)
 		} else {
-			logPath := filepath.Join(c.logDir, containerID+".log")
-			lf, lfErr := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-			if lfErr != nil {
-				log.Printf("Warning: cannot open log file %s: %v", logPath, lfErr)
-			} else {
-				// Tighten files created by older versions with 0644.
-				_ = lf.Chmod(0600)
-				logFile = lf
-				logWriter = io.MultiWriter(rb, lf)
-			}
+			logFile = lf
+			logWriter = io.MultiWriter(rb, lf)
 		}
 	}
 
