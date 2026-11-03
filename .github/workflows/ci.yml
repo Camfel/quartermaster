@@ -12,9 +12,10 @@ jobs:
       - name: Race detector
         run: make test-race
       - name: govulncheck
-        # Non-blocking: three containerd v1.7.x CRI checkpoint issues have no
-        # 1.7.x fix and are unreachable from this client. Flip to blocking once
-        # the remaining findings are triaged or containerd v2 is adopted.
+        # Non-blocking: four containerd v1.7.x CRI checkpoint/restore issues
+        # (GO-2026-6791/5622/5338/5064) have no 1.7.x fix and are unreachable
+        # from this client. Flip to blocking once they are triaged or
+        # containerd v2 is adopted.
         continue-on-error: true
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
